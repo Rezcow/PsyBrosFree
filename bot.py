@@ -74,6 +74,21 @@ async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_
     finally:
         await manejar_eliminacion_segura(output_path)
 
+async def obtener_datos_spotify_con_odesli(url: str):
+    api_url = f"https://api.song.link/v1-alpha.1/links?url={url}"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(api_url, timeout=10)
+            if response.status_code != 200:
+                return None, None
+            data = response.json()
+            unique_id = data.get("entityUniqueId")
+            entity_data = data.get("entitiesByUniqueId", {}).get(unique_id, {})
+            return entity_data.get("title"), entity_data.get("artistName")
+    except Exception as e:
+        print(f"Error obteniendo datos de Spotify: {e}")
+        return None, None
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
@@ -90,15 +105,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "spotify.com/track" in url:
         try:
-            await update.message.reply_text("🎧 Obteniendo título de la canción desde Spotify...")
-            result = subprocess.run(["yt-dlp", "--print", "%(title)s", url], capture_output=True, text=True)
-            title = result.stdout.strip()
+            await update.message.reply_text("🎧 Obteniendo título desde Spotify...")
+            title, artist = await obtener_datos_spotify_con_odesli(url)
 
-            if title:
-                await update.message.reply_text(f"🔍 Buscando en YouTube: {title}")
-                await buscar_y_descargar(title, chat_id, context)
+            if title and artist:
+                query = f"{title} {artist}"
+                await update.message.reply_text(f"🔍 Buscando en YouTube: {query}")
+                await buscar_y_descargar(query, chat_id, context)
             else:
-                await update.message.reply_text("❌ No se pudo extraer el título desde Spotify.")
+                await update.message.reply_text("❌ No se pudo extraer el título/artista desde Spotify.")
         except Exception as e:
             await update.message.reply_text(f"❌ Spotify error: {e}")
 
