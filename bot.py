@@ -105,28 +105,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "album" in url and "spotify.com" in url:
         try:
-            await update.message.reply_text("🎵 Obteniendo canciones del álbum...")
-            result = subprocess.run(["spotdl", url, "--dry-run"], capture_output=True, text=True)
-            lines = result.stdout.splitlines()
-            songs = [line for line in lines if line.startswith("https://music.youtube.com") or line.startswith("https://www.youtube.com")]
-            for song_url in songs:
-                query = song_url.split("v=")[-1]
-                await buscar_y_descargar(query, chat_id, context)
+            await update.message.reply_text("🎵 Obteniendo canciones del álbum desde Spotify...")
+            result = subprocess.run(["yt-dlp", "--flat-playlist", "--print", "%(title)s", url], capture_output=True, text=True)
+            lines = result.stdout.strip().splitlines()
+            for title in lines:
+                await buscar_y_descargar(title, chat_id, context)
         except Exception as e:
-            await update.message.reply_text(f"❌ Error al procesar álbum Spotify: {str(e)}")
+            await update.message.reply_text(f"❌ Error al procesar álbum Spotify:\n{str(e)}")
 
     elif "spotify.com" in url:
         try:
-            await update.message.reply_text("🎵 Descargando desde Spotify...")
-            result = subprocess.run(["spotdl", url, "--dry-run"], capture_output=True, text=True)
-            lines = result.stdout.splitlines()
-            for line in lines:
-                if line.startswith("https://music.youtube.com") or line.startswith("https://www.youtube.com"):
-                    query = line.split("v=")[-1]
-                    await buscar_y_descargar(query, chat_id, context)
-                    break
+            await update.message.reply_text("🎵 Buscando en YouTube equivalente a la canción de Spotify...")
+            result = subprocess.run(["yt-dlp", "--print", "%(title)s", url], capture_output=True, text=True)
+            title = result.stdout.strip()
+            if title:
+                await buscar_y_descargar(title, chat_id, context)
+            else:
+                await update.message.reply_text("❌ No se pudo obtener el título desde Spotify.")
         except Exception as e:
-            await update.message.reply_text(f"❌ Error en descarga desde Spotify: {str(e)}")
+            await update.message.reply_text(f"❌ Error en descarga desde Spotify:\n{str(e)}")
 
     elif "youtube.com" in url or "youtu.be" in url:
         filename = os.path.join(DOWNLOADS_DIR, "youtube_video.mp4")
