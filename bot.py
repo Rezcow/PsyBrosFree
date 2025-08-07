@@ -1,23 +1,19 @@
+
 import os
 import subprocess
 import asyncio
 import re
 import httpx
+import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
 BOT_TOKEN = "8194406693:AAHgUSR31UV7qrUCZZOhbAJibi2XrxYmads"
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# --- Utilidades ---
 def extraer_url(text: str) -> str:
-    match = re.search(r"https?://[\w./?=&%-]+", text)
+    match = re.search(r"https?://\S+", text)
     return match.group(0) if match else None
 
 def contiene_enlace_valido(text: str) -> bool:
@@ -31,7 +27,7 @@ async def manejar_eliminacion_segura(path):
         if os.path.exists(path):
             os.remove(path)
     except Exception as e:
-        print(f"No se pudo eliminar el archivo: {path}. Error: {e}")
+        print(f"Error al eliminar {path}: {e}")
 
 async def obtener_teclado_odesli(original_url: str):
     api_url = f"https://api.song.link/v1-alpha.1/links?url={original_url}"
@@ -43,33 +39,20 @@ async def obtener_teclado_odesli(original_url: str):
             data = response.json()
             links = data.get("linksByPlatform", {})
 
-            if not links:
-                return None
-
-            botones = []
-            fila = []
+            botones, fila = [], []
             for i, (nombre, info) in enumerate(links.items()):
                 url = info.get("url")
                 if url:
-                    boton = InlineKeyboardButton(text=nombre.capitalize(), url=url)
-                    fila.append(boton)
+                    fila.append(InlineKeyboardButton(text=nombre.capitalize(), url=url))
                     if len(fila) == 3:
                         botones.append(fila)
                         fila = []
             if fila:
                 botones.append(fila)
-
             return InlineKeyboardMarkup(botones)
     except Exception as e:
-        print(f"Error en consulta a Odesli: {e}")
+        print(f"Odesli error: {e}")
         return None
-
-def es_link_musical(url: str) -> bool:
-    plataformas_musicales = [
-        "spotify.com", "music.apple.com", "youtube.com", "youtu.be",
-        "deezer.com", "tidal.com", "soundcloud.com", "amazon.com/music"
-    ]
-    return any(p in url for p in plataformas_musicales)
 
 async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
     filename = os.path.join(DOWNLOADS_DIR, f"{query}.mp3")
@@ -82,57 +65,49 @@ async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_
     finally:
         await manejar_eliminacion_segura(filename)
 
-# --- Manejo de mensajes ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
 
-    if not text or not contiene_enlace_valido(text):
+    if not contiene_enlace_valido(text):
         return
 
     url = extraer_url(text)
-    print(f"📩 Mensaje recibido: {url}")
+    await update.message.reply_text("🔎 Procesando...")
 
-    if es_link_musical(url):
-        consultando = await update.message.reply_text("🔍 Consultando enlaces equivalentes...")
-        teclado = await obtener_teclado_odesli(url)
-        if teclado:
-            await consultando.delete()
-            await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
-        else:
-            await consultando.edit_text("⚠️ No se pudieron encontrar enlaces equivalentes.")
+    # Botones equivalentes
+    teclado = await obtener_teclado_odesli(url)
+    if teclado:
+        await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
 
-    if "spotify.com" in url:
+    if "spotify.com/track" in url:
         try:
-            await update.message.reply_text("🎵 Buscando en YouTube equivalente a la canción de Spotify...")
-            result = subprocess.run(["spotdl", url, "--dry-run"], capture_output=True, text=True)
-            lines = result.stdout.splitlines()
-            for line in lines:
-                if line.startswith("https://music.youtube.com") or line.startswith("https://www.youtube.com"):
-                    query = line.split("v=")[-1]
-                    await buscar_y_descargar(query, chat_id, context)
-                    return
-            await update.message.reply_text("❌ No se pudo obtener el título desde Spotify.")
+            await update.message.reply_text("🎧 Buscandoando...")
+            result = subprocess.run(["yt-dlp", "-j", url], capture_output=True, text=True)
+            data = json.loads(result.stdout)
+            title = data.get("title")
+            if title:
+                await buscar_y_descargar(title, chat_id, context)
+            else:
+                await update.message.reply_text("❌ No se pudo.")
         except Exception as e:
-            await update.message.reply_text(f"❌ No se pudo procesar URL Spotify.\n{e}")
+            await update.message.reply_text(f"❌ No se pudo procesar URL Spotify.
+{str(e)}")
 
-    elif "youtube.com" in url or "youtu.be" in url:
-        filename = os.path.join(DOWNLOADS_DIR, "youtube_video.mp4")
+    elif "youtu" in url:
+        filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
         try:
-            await update.message.reply_text("🎮 Tu descarga está en camino...")
-            subprocess.run(["yt-dlp", "--no-playlist", "-f", "mp4", "-o", filename, url], check=True)
-            with open(filename, 'rb') as video_file:
-                await context.bot.send_video(chat_id=chat_id, video=video_file)
+            subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
+            with open(filename, 'rb') as f:
+                await context.bot.send_video(chat_id=chat_id, video=f)
         except Exception as e:
-            await update.message.reply_text(f"❌ Error en descarga desde YouTube:\n{str(e)}")
+            await update.message.reply_text(f"❌ YouTube error: {e}")
         finally:
             await manejar_eliminacion_segura(filename)
 
     elif "soundcloud.com" in url:
         try:
-            await update.message.reply_text("🎶 Descargando desde SoundCloud...")
-            url_limpia = limpiar_url_soundcloud(url)
-            subprocess.run(["scdl", "-l", url_limpia, "-o", DOWNLOADS_DIR, "-f", "--onlymp3"], check=True)
+            subprocess.run(["scdl", "-l", limpiar_url_soundcloud(url), "-o", DOWNLOADS_DIR, "-f", "--onlymp3"], check=True)
             for file in os.listdir(DOWNLOADS_DIR):
                 if file.endswith(".mp3"):
                     path = os.path.join(DOWNLOADS_DIR, file)
@@ -140,37 +115,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.send_audio(chat_id=chat_id, audio=audio_file)
                     await manejar_eliminacion_segura(path)
         except Exception as e:
-            await update.message.reply_text(f"❌ Error en descarga desde SoundCloud:\n{str(e)}")
+            await update.message.reply_text(f"❌ SoundCloud error: {e}")
 
     elif "instagram.com" in url:
-        filename = os.path.join(DOWNLOADS_DIR, "insta_video.mp4")
+        filename = os.path.join(DOWNLOADS_DIR, "insta.mp4")
         try:
-            await update.message.reply_text("📸 Descargando desde Instagram...")
             subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
-            with open(filename, 'rb') as video_file:
-                await context.bot.send_video(chat_id=chat_id, video=video_file)
+            with open(filename, 'rb') as f:
+                await context.bot.send_video(chat_id=chat_id, video=f)
         except Exception as e:
-            await update.message.reply_text(f"❌ Error en descarga desde Instagram:\n{str(e)}")
+            await update.message.reply_text(f"❌ Instagram error: {e}")
         finally:
             await manejar_eliminacion_segura(filename)
 
-    elif "x.com" in url or "twitter.com" in url:
-        filename = os.path.join(DOWNLOADS_DIR, "twitter_video.mp4")
+    elif "twitter.com" in url or "x.com" in url:
+        filename = os.path.join(DOWNLOADS_DIR, "x.mp4")
         try:
-            await update.message.reply_text("🐦 Descargando desde X (Twitter)...")
             subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
-            with open(filename, 'rb') as video_file:
-                await context.bot.send_video(chat_id=chat_id, video=video_file)
+            with open(filename, 'rb') as f:
+                await context.bot.send_video(chat_id=chat_id, video=f)
         except Exception as e:
-            await update.message.reply_text(f"❌ Error en descarga desde X:\n{str(e)}")
+            await update.message.reply_text(f"❌ Twitter error: {e}")
         finally:
             await manejar_eliminacion_segura(filename)
 
-# --- Inicio del bot ---
 async def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("✅ Bot iniciado. Esperando mensajes...")
+    print("✅ Bot listo. Esperando mensajes...")
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
@@ -180,4 +152,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("🛑 Bot detenido por el usuario.")
+        print("🛑 Bot detenido.")
