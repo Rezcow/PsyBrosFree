@@ -17,13 +17,12 @@ DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 # --- Utilidades ---
+def extraer_url(text: str) -> str:
+    match = re.search(r"https?://[\w./?=&%-]+", text)
+    return match.group(0) if match else None
+
 def contiene_enlace_valido(text: str) -> bool:
-    enlaces_validos = [
-        "youtube.com", "youtu.be", "spotify.com",
-        "soundcloud.com", "instagram.com", "x.com", "twitter.com",
-        "music.apple.com"
-    ]
-    return any(dominio in text for dominio in enlaces_validos)
+    return extraer_url(text) is not None
 
 def limpiar_url_soundcloud(url: str) -> str:
     return re.sub(r"\?.*", "", url)
@@ -66,22 +65,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text or not contiene_enlace_valido(text):
         return
 
-    print(f"\U0001F4E9 Mensaje recibido: {text}")
+    url = extraer_url(text)
+    print(f"\U0001F4E9 Mensaje recibido: {url}")
 
     # --- Odesli feedback ---
     await update.message.reply_text("🔍 Consultando enlaces equivalentes...")
-    enlaces_convertidos = await obtener_links_odesli(text)
+    enlaces_convertidos = await obtener_links_odesli(url)
     if enlaces_convertidos:
         await update.message.reply_text(enlaces_convertidos)
     else:
         await update.message.reply_text("⚠️ No se pudieron encontrar enlaces equivalentes.")
 
     # --- YouTube ---
-    if "youtube.com" in text or "youtu.be" in text:
+    if "youtube.com" in url or "youtu.be" in url:
         filename = os.path.join(DOWNLOADS_DIR, "youtube_video.mp4")
         try:
             await update.message.reply_text("🎬 Tu descarga está en camino...")
-            subprocess.run(["yt-dlp", "--no-playlist", "-f", "mp4", "-o", filename, text], check=True)
+            subprocess.run(["yt-dlp", "--no-playlist", "-f", "mp4", "-o", filename, url], check=True)
             with open(filename, 'rb') as video_file:
                 await context.bot.send_video(chat_id=chat_id, video=video_file)
         except Exception as e:
@@ -90,11 +90,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await manejar_eliminacion_segura(filename)
 
     # --- Spotify (descarga) ---
-    elif "spotify.com" in text:
+    elif "spotify.com" in url:
         try:
             await update.message.reply_text("🎵 Descargando desde Spotify...")
             filename = os.path.join(DOWNLOADS_DIR, f"spotify_{os.getpid()}.mp3")
-            subprocess.run(["spotdl", text, "--output", filename], check=True)
+            subprocess.run(["spotdl", url, "--output", filename], check=True)
             with open(filename, 'rb') as audio_file:
                 await context.bot.send_audio(chat_id=chat_id, audio=audio_file)
         except Exception as e:
@@ -103,10 +103,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await manejar_eliminacion_segura(filename)
 
     # --- SoundCloud ---
-    elif "soundcloud.com" in text:
+    elif "soundcloud.com" in url:
         try:
             await update.message.reply_text("🎶 Descargando desde SoundCloud...")
-            url_limpia = limpiar_url_soundcloud(text)
+            url_limpia = limpiar_url_soundcloud(url)
             subprocess.run(["scdl", "-l", url_limpia, "-o", DOWNLOADS_DIR, "-f", "--onlymp3"], check=True)
             for file in os.listdir(DOWNLOADS_DIR):
                 if file.endswith(".mp3"):
@@ -118,11 +118,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Error en descarga desde SoundCloud:\n{str(e)}")
 
     # --- Instagram ---
-    elif "instagram.com" in text:
+    elif "instagram.com" in url:
         filename = os.path.join(DOWNLOADS_DIR, "insta_video.mp4")
         try:
             await update.message.reply_text("📸 Descargando desde Instagram...")
-            subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, text], check=True)
+            subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
             with open(filename, 'rb') as video_file:
                 await context.bot.send_video(chat_id=chat_id, video=video_file)
         except Exception as e:
@@ -131,11 +131,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await manejar_eliminacion_segura(filename)
 
     # --- X / Twitter ---
-    elif "x.com" in text or "twitter.com" in text:
+    elif "x.com" in url or "twitter.com" in url:
         filename = os.path.join(DOWNLOADS_DIR, "twitter_video.mp4")
         try:
             await update.message.reply_text("🐦 Descargando desde X (Twitter)...")
-            subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, text], check=True)
+            subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
             with open(filename, 'rb') as video_file:
                 await context.bot.send_video(chat_id=chat_id, video=video_file)
         except Exception as e:
