@@ -48,16 +48,19 @@ async def obtener_teclado_odesli(original_url: str):
                 return None
 
             botones = []
-            for nombre, info in links.items():
+            fila = []
+            for i, (nombre, info) in enumerate(links.items()):
                 url = info.get("url")
                 if url:
-                    botones.append(InlineKeyboardButton(text=nombre.capitalize(), url=url))
+                    boton = InlineKeyboardButton(text=nombre.capitalize(), url=url)
+                    fila.append(boton)
+                    if len(fila) == 2:
+                        botones.append(fila)
+                        fila = []
+            if fila:
+                botones.append(fila)
 
-            if botones:
-                return InlineKeyboardMarkup.from_column(botones)
-            else:
-                return None
-
+            return InlineKeyboardMarkup(botones)
     except Exception as e:
         print(f"Error en consulta a Odesli: {e}")
         return None
@@ -98,14 +101,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif "spotify.com" in url:
         try:
             await update.message.reply_text("🎵 Descargando desde Spotify...")
-            filename = os.path.join(DOWNLOADS_DIR, f"spotify_{os.getpid()}.mp3")
-            subprocess.run(["spotdl", url, "--output", filename], check=True)
-            with open(filename, 'rb') as audio_file:
-                await context.bot.send_audio(chat_id=chat_id, audio=audio_file)
+            subprocess.run(["spotdl", url, "--output", DOWNLOADS_DIR], check=True)
+            mp3_files = [f for f in os.listdir(DOWNLOADS_DIR) if f.endswith(".mp3")]
+            if not mp3_files:
+                raise FileNotFoundError("No se encontró ningún archivo MP3 luego de la descarga.")
+            for file in mp3_files:
+                path = os.path.join(DOWNLOADS_DIR, file)
+                with open(path, 'rb') as audio_file:
+                    await context.bot.send_audio(chat_id=chat_id, audio=audio_file)
+                await manejar_eliminacion_segura(path)
         except Exception as e:
             await update.message.reply_text(f"❌ Error en descarga desde Spotify:\n{str(e)}")
-        finally:
-            await manejar_eliminacion_segura(filename)
 
     # --- SoundCloud ---
     elif "soundcloud.com" in url:
