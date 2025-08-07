@@ -3,10 +3,11 @@ import subprocess
 import re
 import httpx
 import json
+import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
-BOT_TOKEN = "8194406693:AAEaxgwVWdQIRjZNUBcal3ttnqCtjfja3Ek"  # Reemplaza esto con tu token real
+BOT_TOKEN = "8194406693:AAEaxgwVWdQIRjZNUBcal3ttnqCtjfja3Ek"  # Reemplaza esto
 downloads_dir = "downloads"
 os.makedirs(downloads_dir, exist_ok=True)
 
@@ -54,25 +55,38 @@ async def obtener_teclado_odesli(original_url: str):
 
 async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
     try:
-        subprocess.run([
+        output_template = os.path.join(downloads_dir, "%(title)s.%(ext)s")
+        before_files = set(os.listdir(downloads_dir))
+
+        process = subprocess.run([
             "yt-dlp",
             f"ytsearch1:{query}",
             "--extract-audio",
             "--audio-format", "mp3",
-            "-o", os.path.join(downloads_dir, "%(title)s.%(ext)s")
-        ], check=True)
+            "-o", output_template
+        ], capture_output=True, text=True)
 
-        for filename in os.listdir(downloads_dir):
-            if filename.endswith(".mp3"):
-                path = os.path.join(downloads_dir, filename)
-                with open(path, 'rb') as audio_file:
-                    await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
-                await manejar_eliminacion_segura(path)
-                return
+        print("yt-dlp STDOUT:\n", process.stdout)
+        print("yt-dlp STDERR:\n", process.stderr)
 
-        await context.bot.send_message(chat_id=chat_id, text="❌ No se encontró ningún archivo de audio.")
+        time.sleep(2)
+
+        after_files = set(os.listdir(downloads_dir))
+        nuevos = after_files - before_files
+        mp3_files = [f for f in nuevos if f.lower().endswith(".mp3")]
+
+        if not mp3_files:
+            await context.bot.send_message(chat_id=chat_id, text="❌ No se encontró archivo MP3 después de la descarga.")
+            return
+
+        filename = mp3_files[0]
+        path = os.path.join(downloads_dir, filename)
+        with open(path, 'rb') as audio_file:
+            await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
+        await manejar_eliminacion_segura(path)
+
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo descargar: {query} ({e})")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Error al descargar: {query}\n{str(e)}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
