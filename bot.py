@@ -1,3 +1,4 @@
+
 import os 
 import subprocess
 import asyncio
@@ -37,6 +38,7 @@ async def obtener_teclado_odesli(original_url: str):
                 return None
             data = response.json()
             links = data.get("linksByPlatform", {})
+
             botones, fila = [], []
             for i, (nombre, info) in enumerate(links.items()):
                 url = info.get("url")
@@ -72,22 +74,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = extraer_url(text)
     await update.message.reply_text("🔎 Procesando...")
+
+    # Botones equivalentes
     teclado = await obtener_teclado_odesli(url)
     if teclado:
         await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
 
     if "spotify.com/track" in url:
         try:
-            await update.message.reply_text("🎧 Buscando...")
-            result = subprocess.run(["spotdl", url, "--json"], capture_output=True, text=True)
-            data = json.loads(result.stdout)
-            title = data.get("name") or data.get("title")
-            if title:
-                await buscar_y_descargar(title, chat_id, context)
+            await update.message.reply_text("🎧 Buscando en YouTube equivalente a la canción de Spotify...")
+            result = subprocess.run(["spotdl", url, "--dry-run"], capture_output=True, text=True)
+            lines = result.stdout.splitlines()
+            for line in lines:
+                if line.startswith("https://music.youtube.com") or line.startswith("https://www.youtube.com"):
+                    query = line.split("v=")[-1]
+                    await buscar_y_descargar(query, chat_id, context)
+                    break
             else:
-                await update.message.reply_text("❌ No se pudo obtener título desde Spotify.")
+                await update.message.reply_text("❌ No se pudo encontrar equivalente en YouTube.")
         except Exception as e:
-            await update.message.reply_text(f"❌ Error Spotify: {str(e)}")
+            await update.message.reply_text(f"❌ Error al procesar canción de Spotify: {str(e)}")
 
     elif "youtu" in url:
         filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
