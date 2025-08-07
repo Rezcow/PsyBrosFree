@@ -6,9 +6,9 @@ import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
-BOT_TOKEN = "8194406693:AAEaxgwVWdQIRjZNUBcal3ttnqCtjfja3Ek"
-DOWNLOADS_DIR = "downloads"
-os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+BOT_TOKEN = "8194406693:AAEaxgwVWdQIRjZNUBcal3ttnqCtjfja3Ek"  # Reemplaza esto con tu token real
+downloads_dir = "downloads"
+os.makedirs(downloads_dir, exist_ok=True)
 
 def extraer_url(text: str) -> str:
     match = re.search(r"https?://\S+", text)
@@ -53,41 +53,26 @@ async def obtener_teclado_odesli(original_url: str):
         return None
 
 async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
-    sanitized = re.sub(r'[\\/*?:"<>|]', "", query)
-    output_path = os.path.join(DOWNLOADS_DIR, f"{sanitized}.mp3")
     try:
         subprocess.run([
             "yt-dlp",
             f"ytsearch1:{query}",
             "--extract-audio",
             "--audio-format", "mp3",
-            "-o", output_path
+            "-o", os.path.join(downloads_dir, "%(title)s.%(ext)s")
         ], check=True)
 
-        if os.path.exists(output_path):
-            with open(output_path, 'rb') as audio_file:
-                await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text="❌ No se generó archivo de audio.")
+        for filename in os.listdir(downloads_dir):
+            if filename.endswith(".mp3"):
+                path = os.path.join(downloads_dir, filename)
+                with open(path, 'rb') as audio_file:
+                    await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
+                await manejar_eliminacion_segura(path)
+                return
+
+        await context.bot.send_message(chat_id=chat_id, text="❌ No se encontró ningún archivo de audio.")
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo descargar: {query} ({e})")
-    finally:
-        await manejar_eliminacion_segura(output_path)
-
-async def obtener_datos_spotify_con_odesli(url: str):
-    api_url = f"https://api.song.link/v1-alpha.1/links?url={url}"
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(api_url, timeout=10)
-            if response.status_code != 200:
-                return None, None
-            data = response.json()
-            unique_id = data.get("entityUniqueId")
-            entity_data = data.get("entitiesByUniqueId", {}).get(unique_id, {})
-            return entity_data.get("title"), entity_data.get("artistName")
-    except Exception as e:
-        print(f"Error obteniendo datos de Spotify: {e}")
-        return None, None
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -105,20 +90,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "spotify.com/track" in url:
         try:
-            await update.message.reply_text("🎧 Obteniendo título desde Spotify...")
-            title, artist = await obtener_datos_spotify_con_odesli(url)
+            await update.message.reply_text("🎧 Obteniendo título de la canción desde Spotify...")
+            result = subprocess.run(["yt-dlp", "--print", "%(title)s", url], capture_output=True, text=True)
+            title = result.stdout.strip()
 
-            if title and artist:
-                query = f"{title} {artist}"
-                await update.message.reply_text(f"🔍 Buscando en YouTube: {query}")
-                await buscar_y_descargar(query, chat_id, context)
+            if title:
+                await update.message.reply_text(f"🔍 Buscando en YouTube: {title}")
+                await buscar_y_descargar(title, chat_id, context)
             else:
-                await update.message.reply_text("❌ No se pudo extraer el título/artista desde Spotify.")
+                await update.message.reply_text("❌ No se pudo extraer el título desde Spotify.")
         except Exception as e:
             await update.message.reply_text(f"❌ Spotify error: {e}")
 
     elif "youtu" in url:
-        filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
+        filename = os.path.join(downloads_dir, "youtube.mp4")
         try:
             subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
             with open(filename, 'rb') as f:
@@ -130,10 +115,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif "soundcloud.com" in url:
         try:
-            subprocess.run(["scdl", "-l", limpiar_url_soundcloud(url), "-o", DOWNLOADS_DIR, "-f", "--onlymp3"], check=True)
-            for file in os.listdir(DOWNLOADS_DIR):
+            subprocess.run(["scdl", "-l", limpiar_url_soundcloud(url), "-o", downloads_dir, "-f", "--onlymp3"], check=True)
+            for file in os.listdir(downloads_dir):
                 if file.endswith(".mp3"):
-                    path = os.path.join(DOWNLOADS_DIR, file)
+                    path = os.path.join(downloads_dir, file)
                     with open(path, 'rb') as audio_file:
                         await context.bot.send_audio(chat_id=chat_id, audio=audio_file)
                     await manejar_eliminacion_segura(path)
@@ -141,7 +126,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ SoundCloud error: {e}")
 
     elif "instagram.com" in url:
-        filename = os.path.join(DOWNLOADS_DIR, "insta.mp4")
+        filename = os.path.join(downloads_dir, "insta.mp4")
         try:
             subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
             with open(filename, 'rb') as f:
@@ -152,7 +137,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await manejar_eliminacion_segura(filename)
 
     elif "twitter.com" in url or "x.com" in url:
-        filename = os.path.join(DOWNLOADS_DIR, "x.mp4")
+        filename = os.path.join(downloads_dir, "x.mp4")
         try:
             subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
             with open(filename, 'rb') as f:
