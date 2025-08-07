@@ -72,6 +72,17 @@ def es_link_musical(url: str) -> bool:
     ]
     return any(p in url for p in plataformas_musicales)
 
+async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
+    filename = os.path.join(DOWNLOADS_DIR, f"{query}.mp3")
+    try:
+        subprocess.run(["yt-dlp", f"ytsearch1:{query}", "--extract-audio", "--audio-format", "mp3", "-o", filename], check=True)
+        with open(filename, 'rb') as audio_file:
+            await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo descargar: {query}")
+    finally:
+        await manejar_eliminacion_segura(filename)
+
 # --- Manejo de mensajes ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -83,18 +94,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = extraer_url(text)
     print(f"\U0001F4E9 Mensaje recibido: {url}")
 
-    # --- Solo consulta Odesli si el link es musical ---
     if es_link_musical(url):
-        mensaje_consulta = await update.message.reply_text("🔍 Consultando enlaces equivalentes...")
+        consultando = await update.message.reply_text("🔍 Consultando enlaces equivalentes...")
         teclado = await obtener_teclado_odesli(url)
-        await context.bot.delete_message(chat_id=chat_id, message_id=mensaje_consulta.message_id)
         if teclado:
+            await consultando.delete()
             await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
         else:
-            await update.message.reply_text("⚠️ No se pudieron encontrar enlaces equivalentes.")
+            await consultando.edit_text("⚠️ No se pudieron encontrar enlaces equivalentes.")
 
-    # --- YouTube ---
-    if "youtube.com" in url or "youtu.be" in url:
+    if "album" in url and "spotify.com" in url:
+        try:
+            await update.message.reply_text("🎵 Obteniendo canciones del álbum...")
+            result = subprocess.run(["spotdl", url, "--dry-run"], capture_output=True, text=True)
+            lines = result.stdout.splitlines()
+            songs = [line for line in lines if line.startswith("https://music.youtube.com") or line.startswith("https://www.youtube.com")]
+            for song_url in songs:
+                query = song_url.split("v=")[-1]
+                await buscar_y_descargar(query, chat_id, context)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error al procesar álbum Spotify: {str(e)}")
+
+    elif "spotify.com" in url:
+        try:
+            await update.message.reply_text("🎵 Descargando desde Spotify...")
+            result = subprocess.run(["spotdl", url, "--dry-run"], capture_output=True, text=True)
+            lines = result.stdout.splitlines()
+            for line in lines:
+                if line.startswith("https://music.youtube.com") or line.startswith("https://www.youtube.com"):
+                    query = line.split("v=")[-1]
+                    await buscar_y_descargar(query, chat_id, context)
+                    break
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error en descarga desde Spotify: {str(e)}")
+
+    elif "youtube.com" in url or "youtu.be" in url:
         filename = os.path.join(DOWNLOADS_DIR, "youtube_video.mp4")
         try:
             await update.message.reply_text("🎬 Tu descarga está en camino...")
@@ -106,23 +140,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             await manejar_eliminacion_segura(filename)
 
-    # --- Spotify (descarga) ---
-    elif "spotify.com" in url:
-        try:
-            mensaje_descarga = await update.message.reply_text("🎵 Descargando desde Spotify...")
-            subprocess.run(["spotdl", url, "--output", DOWNLOADS_DIR], check=True)
-            mp3_files = [f for f in os.listdir(DOWNLOADS_DIR) if f.endswith(".mp3")]
-            if not mp3_files:
-                raise FileNotFoundError("No se encontró ningún archivo MP3 luego de la descarga.")
-            for file in mp3_files:
-                path = os.path.join(DOWNLOADS_DIR, file)
-                with open(path, 'rb') as audio_file:
-                    await context.bot.send_audio(chat_id=chat_id, audio=audio_file, reply_to_message_id=mensaje_descarga.message_id)
-                await manejar_eliminacion_segura(path)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error en descarga desde Spotify:\n{str(e)}")
-
-    # --- SoundCloud ---
     elif "soundcloud.com" in url:
         try:
             await update.message.reply_text("🎶 Descargando desde SoundCloud...")
@@ -137,7 +154,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ Error en descarga desde SoundCloud:\n{str(e)}")
 
-    # --- Instagram ---
     elif "instagram.com" in url:
         filename = os.path.join(DOWNLOADS_DIR, "insta_video.mp4")
         try:
@@ -150,7 +166,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             await manejar_eliminacion_segura(filename)
 
-    # --- X / Twitter ---
     elif "x.com" in url or "twitter.com" in url:
         filename = os.path.join(DOWNLOADS_DIR, "twitter_video.mp4")
         try:
