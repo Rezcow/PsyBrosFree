@@ -54,25 +54,26 @@ async def obtener_teclado_odesli(original_url: str):
         return None
 
 async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
+    sanitized = re.sub(r'[\\/*?:"<>|]', "", query)
+    output_path = os.path.join(DOWNLOADS_DIR, f"{sanitized}.mp3")
     try:
-        result = subprocess.run([
+        subprocess.run([
             "yt-dlp",
             f"ytsearch1:{query}",
             "--extract-audio",
             "--audio-format", "mp3",
-            "-o", f"{DOWNLOADS_DIR}/%(title)s.%(ext)s"
-        ], capture_output=True, text=True)
+            "-o", output_path
+        ], check=True)
 
-        match = re.search(r"\[download\]\s+Destination:\s+(.*\.mp3)", result.stdout)
-        if match:
-            filepath = match.group(1)
-            with open(filepath, 'rb') as audio_file:
+        if os.path.exists(output_path):
+            with open(output_path, 'rb') as audio_file:
                 await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
-            await manejar_eliminacion_segura(filepath)
         else:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo encontrar archivo MP3.")
+            await context.bot.send_message(chat_id=chat_id, text="❌ No se generó archivo de audio.")
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo descargar: {query}\n{e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo descargar: {query} ({e})")
+    finally:
+        await manejar_eliminacion_segura(output_path)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -84,7 +85,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = extraer_url(text)
     await update.message.reply_text("🔎 Procesando...")
 
-    # Mostrar botones equivalentes (Odesli)
     teclado = await obtener_teclado_odesli(url)
     if teclado:
         await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
@@ -92,19 +92,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "spotify.com/track" in url:
         try:
             await update.message.reply_text("🎧 Buscando canción...")
-            result = subprocess.run(["spotdl", "--name", url], capture_output=True, text=True)
-            lines = result.stdout.splitlines()
-            song_title = ""
-            for line in lines:
-                if "Title:" in line:
-                    song_title = line.split("Title:")[1].strip()
-                    break
-            if song_title:
-                await buscar_y_descargar(song_title, chat_id, context)
+            result = subprocess.run(["yt-dlp", "-j", url], capture_output=True, text=True)
+            data = json.loads(result.stdout)
+            title = data.get("title")
+            if title:
+                await buscar_y_descargar(title, chat_id, context)
             else:
                 await update.message.reply_text("❌ No se pudo obtener el título de la canción.")
         except Exception as e:
-            await update.message.reply_text(f"❌ Error Spotify: {str(e)}")
+            await update.message.reply_text(f"❌ Spotify error: {e}")
 
     elif "youtu" in url:
         filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
@@ -150,8 +146,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Twitter/X error: {e}")
         finally:
             await manejar_eliminacion_segura(filename)
-
-# ---- Punto de entrada principal ----
 
 if __name__ == "__main__":
     app = Application.builder().token(BOT_TOKEN).build()
