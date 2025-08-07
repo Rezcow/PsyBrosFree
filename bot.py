@@ -1,4 +1,3 @@
-
 import os
 import subprocess
 import re
@@ -91,14 +90,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "spotify.com/track" in url:
         try:
-            await update.message.reply_text("🎧 Buscando canción...")
-            result = subprocess.run(["yt-dlp", "-j", url], capture_output=True, text=True)
-            data = json.loads(result.stdout)
-            title = data.get("title")
+            await update.message.reply_text("🎧 Obteniendo título de la canción desde Spotify...")
+            result = subprocess.run(["yt-dlp", "--print", "%(title)s", url], capture_output=True, text=True)
+            title = result.stdout.strip()
+
             if title:
+                await update.message.reply_text(f"🔍 Buscando en YouTube: {title}")
                 await buscar_y_descargar(title, chat_id, context)
             else:
-                await update.message.reply_text("❌ No se pudo obtener el título de la canción.")
+                await update.message.reply_text("❌ No se pudo extraer el título desde Spotify.")
         except Exception as e:
             await update.message.reply_text(f"❌ Spotify error: {e}")
 
