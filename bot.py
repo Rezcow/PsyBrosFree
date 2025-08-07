@@ -14,9 +14,6 @@ from telegram.ext import (
 # --- Configuración inicial ---
 BOT_TOKEN = "8194406693:AAHgUSR31UV7qrUCZZOhbAJibi2XrxYmads"
 DOWNLOADS_DIR = "downloads"
-WEBHOOK_PATH = "/webhook"
-BASE_URL = "https://TU_PROYECTO.up.railway.app"  # Reemplaza esto con tu URL real en Railway
-
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 # --- Utilidades ---
@@ -95,7 +92,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     url = extraer_url(text)
-    print(f"📩 Mensaje recibido: {url}")
+    print(f"\U0001F4E9 Mensaje recibido: {url}")
 
     if es_link_musical(url):
         consultando = await update.message.reply_text("🔍 Consultando enlaces equivalentes...")
@@ -134,7 +131,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif "youtube.com" in url or "youtu.be" in url:
         filename = os.path.join(DOWNLOADS_DIR, "youtube_video.mp4")
         try:
-            await update.message.reply_text("🎮 Tu descarga está en camino...")
+            await update.message.reply_text("🎬 Tu descarga está en camino...")
             subprocess.run(["yt-dlp", "--no-playlist", "-f", "mp4", "-o", filename, url], check=True)
             with open(filename, 'rb') as video_file:
                 await context.bot.send_video(chat_id=chat_id, video=video_file)
@@ -185,21 +182,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("✅ Bot iniciado con webhook. Esperando mensajes...")
-    await app.initialize()
-    await app.start()
-
-    webhook_url = BASE_URL + WEBHOOK_PATH
-    await app.bot.set_webhook(url=webhook_url)
-    await app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000)),
-        url_path=WEBHOOK_PATH,
-        webhook_url=webhook_url
-    )
+    print("✅ Bot iniciado. Esperando mensajes...")
+    await app.run_polling()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("🛑 Bot detenido por el usuario.")
+    asyncio.run(main())
