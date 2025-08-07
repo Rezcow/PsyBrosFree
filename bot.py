@@ -3,7 +3,7 @@ import subprocess
 import asyncio
 import re
 import httpx
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -34,7 +34,7 @@ async def manejar_eliminacion_segura(path):
     except Exception as e:
         print(f"No se pudo eliminar el archivo: {path}. Error: {e}")
 
-async def obtener_links_odesli(original_url: str) -> str:
+async def obtener_teclado_odesli(original_url: str):
     api_url = f"https://api.song.link/v1-alpha.1/links?url={original_url}"
     try:
         async with httpx.AsyncClient() as client:
@@ -47,12 +47,17 @@ async def obtener_links_odesli(original_url: str) -> str:
             if not links:
                 return None
 
-            resultado = "\n\n🌐 Enlaces en otras plataformas:\n"
+            botones = []
             for nombre, info in links.items():
                 url = info.get("url")
                 if url:
-                    resultado += f"- {nombre.capitalize()}: {url}\n"
-            return resultado.strip()
+                    botones.append(InlineKeyboardButton(text=nombre.capitalize(), url=url))
+
+            if botones:
+                return InlineKeyboardMarkup.from_column(botones)
+            else:
+                return None
+
     except Exception as e:
         print(f"Error en consulta a Odesli: {e}")
         return None
@@ -70,9 +75,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Odesli feedback ---
     await update.message.reply_text("🔍 Consultando enlaces equivalentes...")
-    enlaces_convertidos = await obtener_links_odesli(url)
-    if enlaces_convertidos:
-        await update.message.reply_text(enlaces_convertidos)
+    teclado = await obtener_teclado_odesli(url)
+    if teclado:
+        await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
     else:
         await update.message.reply_text("⚠️ No se pudieron encontrar enlaces equivalentes.")
 
