@@ -2,6 +2,7 @@ import os
 import subprocess
 import asyncio
 import re
+import json
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -75,13 +76,36 @@ def es_link_musical(url: str) -> bool:
 async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
     filename = os.path.join(DOWNLOADS_DIR, f"{query}.mp3")
     try:
-        subprocess.run(["yt-dlp", f"ytsearch1:{query}", "--extract-audio", "--audio-format", "mp3", "-o", filename], check=True)
+        subprocess.run([
+            "yt-dlp", f"ytsearch1:{query}",
+            "--extract-audio", "--audio-format", "mp3",
+            "-o", filename
+        ], check=True)
         with open(filename, 'rb') as audio_file:
             await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo descargar: {query}")
     finally:
         await manejar_eliminacion_segura(filename)
+
+# --- Spotify (usando yt-dlp -j) ---
+async def manejar_spotify(url: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(chat_id=chat_id, text="🎵 Buscando en YouTube equivalente a la canción de Spotify...")
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "-j", url],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        data = json.loads(result.stdout)
+        title = data.get("title")
+        if title:
+            await buscar_y_descargar(title, chat_id, context)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="❌ No se pudo obtener el título desde Spotify.")
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Error al procesar enlace de Spotify:\n{str(e)}")
 
 # --- Manejo de mensajes ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,27 +127,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await consultando.edit_text("⚠️ No se pudieron encontrar enlaces equivalentes.")
 
-    if "album" in url and "spotify.com" in url:
-        try:
-            await update.message.reply_text("🎵 Obteniendo canciones del álbum desde Spotify...")
-            result = subprocess.run(["yt-dlp", "--flat-playlist", "--print", "%(title)s", url], capture_output=True, text=True)
-            lines = result.stdout.strip().splitlines()
-            for title in lines:
-                await buscar_y_descargar(title, chat_id, context)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error al procesar álbum Spotify:\n{str(e)}")
-
-    elif "spotify.com" in url:
-        try:
-            await update.message.reply_text("🎵 Buscando en YouTube equivalente a la canción de Spotify...")
-            result = subprocess.run(["yt-dlp", "--print", "%(title)s", url], capture_output=True, text=True)
-            title = result.stdout.strip()
-            if title:
-                await buscar_y_descargar(title, chat_id, context)
-            else:
-                await update.message.reply_text("❌ No se pudo obtener el título desde Spotify.")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error en descarga desde Spotify:\n{str(e)}")
+    if "spotify.com" in url:
+        await manejar_spotify(url, chat_id, context)
 
     elif "youtube.com" in url or "youtu.be" in url:
         filename = os.path.join(DOWNLOADS_DIR, "youtube_video.mp4")
