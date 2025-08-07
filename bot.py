@@ -54,7 +54,7 @@ async def obtener_teclado_odesli(original_url: str):
                 if url:
                     boton = InlineKeyboardButton(text=nombre.capitalize(), url=url)
                     fila.append(boton)
-                    if len(fila) == 2:
+                    if len(fila) == 3:
                         botones.append(fila)
                         fila = []
             if fila:
@@ -64,6 +64,13 @@ async def obtener_teclado_odesli(original_url: str):
     except Exception as e:
         print(f"Error en consulta a Odesli: {e}")
         return None
+
+def es_link_musical(url: str) -> bool:
+    plataformas_musicales = [
+        "spotify.com", "music.apple.com", "youtube.com", "youtu.be",
+        "deezer.com", "tidal.com", "soundcloud.com", "amazon.com/music"
+    ]
+    return any(p in url for p in plataformas_musicales)
 
 # --- Manejo de mensajes ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -76,13 +83,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = extraer_url(text)
     print(f"\U0001F4E9 Mensaje recibido: {url}")
 
-    # --- Odesli feedback ---
-    await update.message.reply_text("🔍 Consultando enlaces equivalentes...")
-    teclado = await obtener_teclado_odesli(url)
-    if teclado:
-        await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
-    else:
-        await update.message.reply_text("⚠️ No se pudieron encontrar enlaces equivalentes.")
+    # --- Solo consulta Odesli si el link es musical ---
+    if es_link_musical(url):
+        status = await update.message.reply_text("🔍 Consultando enlaces equivalentes...")
+        teclado = await obtener_teclado_odesli(url)
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=status.message_id)
+        except:
+            pass
+        if teclado:
+            await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
 
     # --- YouTube ---
     if "youtube.com" in url or "youtu.be" in url:
