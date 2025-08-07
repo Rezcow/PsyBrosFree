@@ -2,6 +2,7 @@ import os
 import subprocess
 import asyncio
 import re
+import httpx
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -15,18 +16,17 @@ BOT_TOKEN = "8194406693:AAHgUSR31UV7qrUCZZOhbAJibi2XrxYmads"
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-
+# --- Utilidades ---
 def contiene_enlace_valido(text: str) -> bool:
     enlaces_validos = [
         "youtube.com", "youtu.be", "spotify.com",
-        "soundcloud.com", "instagram.com", "x.com", "twitter.com"
+        "soundcloud.com", "instagram.com", "x.com", "twitter.com",
+        "music.apple.com"
     ]
     return any(dominio in text for dominio in enlaces_validos)
 
-
 def limpiar_url_soundcloud(url: str) -> str:
     return re.sub(r"\?.*", "", url)
-
 
 async def manejar_eliminacion_segura(path):
     try:
@@ -35,6 +35,28 @@ async def manejar_eliminacion_segura(path):
     except Exception as e:
         print(f"No se pudo eliminar el archivo: {path}. Error: {e}")
 
+async def obtener_links_odesli(original_url: str) -> str:
+    api_url = f"https://api.song.link/v1-alpha.1/links?url={original_url}"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(api_url, timeout=10)
+            if response.status_code != 200:
+                return None
+            data = response.json()
+            links = data.get("linksByPlatform", {})
+
+            if not links:
+                return None
+
+            resultado = "\n\n🌐 Enlaces en otras plataformas:\n"
+            for nombre, info in links.items():
+                url = info.get("url")
+                if url:
+                    resultado += f"- {nombre.capitalize()}: {url}\n"
+            return resultado.strip()
+    except Exception as e:
+        print(f"Error en consulta a Odesli: {e}")
+        return None
 
 # --- Manejo de mensajes ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -46,11 +68,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     print(f"\U0001F4E9 Mensaje recibido: {text}")
 
+    # --- Odesli feedback ---
+    await update.message.reply_text("🔍 Consultando enlaces equivalentes...")
+    enlaces_convertidos = await obtener_links_odesli(text)
+    if enlaces_convertidos:
+        await update.message.reply_text(enlaces_convertidos)
+    else:
+        await update.message.reply_text("⚠️ No se pudieron encontrar enlaces equivalentes.")
+
     # --- YouTube ---
     if "youtube.com" in text or "youtu.be" in text:
         filename = os.path.join(DOWNLOADS_DIR, "youtube_video.mp4")
         try:
-            await update.message.reply_text("📹 Descargando video de YouTube...")
+            await update.message.reply_text("🎬 Tu descarga está en camino...")
             subprocess.run(["yt-dlp", "--no-playlist", "-f", "mp4", "-o", filename, text], check=True)
             with open(filename, 'rb') as video_file:
                 await context.bot.send_video(chat_id=chat_id, video=video_file)
@@ -59,7 +89,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             await manejar_eliminacion_segura(filename)
 
-    # --- Spotify (buscando en YouTube) ---
+    # --- Spotify (descarga) ---
     elif "spotify.com" in text:
         try:
             await update.message.reply_text("🎵 Descargando desde Spotify...")
@@ -113,7 +143,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             await manejar_eliminacion_segura(filename)
 
-
 # --- Inicio del bot ---
 async def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -123,7 +152,6 @@ async def main():
     await app.start()
     await app.updater.start_polling()
     await asyncio.Event().wait()
-
 
 if __name__ == "__main__":
     try:
