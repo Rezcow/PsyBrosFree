@@ -128,7 +128,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Spotify (nuevo método usando YouTube) ---
     elif "spotify.com" in url:
         try:
-            await update.message.reply_text("🎵 Buscando canción en YouTube...")
+            await update.message.reply_text("🎵 Descargandoando...")
             query = await obtener_metadata_spotify(url)
             if not query:
                 raise Exception("No se pudo obtener información del tema desde Spotify.")
@@ -144,7 +144,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- SoundCloud ---
     elif "soundcloud.com" in url:
         try:
-            await update.message.reply_text("🎶 Descargando desde SoundCloud...")
+            await update.message.reply_text("🎶 Descargandoando...")
             url_limpia = limpiar_url_soundcloud(url)
             subprocess.run(["scdl", "-l", url_limpia, "-o", DOWNLOADS_DIR, "-f", "--onlymp3"], check=True)
             for file in os.listdir(DOWNLOADS_DIR):
@@ -160,7 +160,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif "instagram.com" in url:
         filename = os.path.join(DOWNLOADS_DIR, "insta_video.mp4")
         try:
-            await update.message.reply_text("📸 Descargando desde Instagram...")
+            await update.message.reply_text("📸 Descargandoando...")
             subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
             with open(filename, 'rb') as video_file:
                 await context.bot.send_video(chat_id=chat_id, video=video_file)
@@ -173,7 +173,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif "x.com" in url or "twitter.com" in url:
         filename = os.path.join(DOWNLOADS_DIR, "twitter_video.mp4")
         try:
-            await update.message.reply_text("🐦 Descargando desde X (Twitter)...")
+            await update.message.reply_text("🐦 Descargandoando...")
             subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
             with open(filename, 'rb') as video_file:
                 await context.bot.send_video(chat_id=chat_id, video=video_file)
