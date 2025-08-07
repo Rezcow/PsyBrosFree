@@ -137,8 +137,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with open(filename, 'rb') as audio_file:
                 await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
         except Exception as e:
-            await update.message.reply_text(f"❌ Error en descarga desde Spotify:
-{str(e)}")
+            await update.message.reply_text(f"❌ Error en descarga desde Spotify: {str(e)}")
         finally:
             await manejar_eliminacion_segura(filename)
 
