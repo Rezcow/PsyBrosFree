@@ -72,6 +72,23 @@ def es_link_musical(url: str) -> bool:
     ]
     return any(p in url for p in plataformas_musicales)
 
+async def obtener_metadata_spotify(url: str):
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"https://api.song.link/v1-alpha.1/links?url={url}", timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                entity = data.get("entitiesByUniqueId", {})
+                if entity:
+                    for track in entity.values():
+                        title = track.get("title")
+                        artist = track.get("artistName")
+                        if title and artist:
+                            return f"{artist} - {title}"
+    except Exception as e:
+        print(f"Error obteniendo metadata de Spotify: {e}")
+    return None
+
 # --- Manejo de mensajes ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -84,15 +101,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"\U0001F4E9 Mensaje recibido: {url}")
 
     # --- Solo consulta Odesli si el link es musical ---
+    mensaje_procesando = None
     if es_link_musical(url):
-        status = await update.message.reply_text("🔍 Consultando enlaces equivalentes...")
+        mensaje_procesando = await update.message.reply_text("🔍 Consultando enlaces equivalentes...")
         teclado = await obtener_teclado_odesli(url)
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=status.message_id)
-        except:
-            pass
         if teclado:
             await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
+        else:
+            await update.message.reply_text("⚠️ No se pudieron encontrar enlaces equivalentes.")
+        if mensaje_procesando:
+            await mensaje_procesando.delete()
 
     # --- YouTube ---
     if "youtube.com" in url or "youtu.be" in url:
@@ -107,21 +125,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             await manejar_eliminacion_segura(filename)
 
-    # --- Spotify (descarga) ---
+    # --- Spotify (nuevo método usando YouTube) ---
     elif "spotify.com" in url:
         try:
-            await update.message.reply_text("🎵 Descargando desde Spotify...")
-            subprocess.run(["spotdl", url, "--output", DOWNLOADS_DIR], check=True)
-            mp3_files = [f for f in os.listdir(DOWNLOADS_DIR) if f.endswith(".mp3")]
-            if not mp3_files:
-                raise FileNotFoundError("No se encontró ningún archivo MP3 luego de la descarga.")
-            for file in mp3_files:
-                path = os.path.join(DOWNLOADS_DIR, file)
-                with open(path, 'rb') as audio_file:
-                    await context.bot.send_audio(chat_id=chat_id, audio=audio_file)
-                await manejar_eliminacion_segura(path)
+            await update.message.reply_text("🎵 Buscando canción en YouTube...")
+            query = await obtener_metadata_spotify(url)
+            if not query:
+                raise Exception("No se pudo obtener información del tema desde Spotify.")
+            filename = os.path.join(DOWNLOADS_DIR, "spotify_song.mp3")
+            subprocess.run(["yt-dlp", f"ytsearch1:{query}", "--extract-audio", "--audio-format", "mp3", "-o", filename], check=True)
+            with open(filename, 'rb') as audio_file:
+                await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
         except Exception as e:
-            await update.message.reply_text(f"❌ Error en descarga desde Spotify:\n{str(e)}")
+            await update.message.reply_text(f"❌ Error en descarga desde Spotify:
+{str(e)}")
+        finally:
+            await manejar_eliminacion_segura(filename)
 
     # --- SoundCloud ---
     elif "soundcloud.com" in url:
