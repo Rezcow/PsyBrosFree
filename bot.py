@@ -91,8 +91,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text("❌ No se pudo.")
         except Exception as e:
-            await update.message.reply_text(f"❌ No se pudo procesar URL Spotify.
-{str(e)}")
+            await update.message.reply_text(f"❌ No se pudo procesar URL Spotify.{str(e)}")
 
     elif "youtu" in url:
         filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
