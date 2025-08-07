@@ -108,7 +108,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🎵 Obteniendo canciones del álbum...")
             result = subprocess.run(["spotdl", url, "--dry-run"], capture_output=True, text=True)
             lines = result.stdout.splitlines()
-            songs = [line for line in lines if line.startswith("https://music.youtube.com") or line.startswith("https://www.youtube.com")]
+            songs = [line for line in lines if "youtube.com" in line]
             for song_url in songs:
                 query = song_url.split("v=")[-1]
                 await buscar_y_descargar(query, chat_id, context)
@@ -121,7 +121,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = subprocess.run(["spotdl", url, "--dry-run"], capture_output=True, text=True)
             lines = result.stdout.splitlines()
             for line in lines:
-                if line.startswith("https://music.youtube.com") or line.startswith("https://www.youtube.com"):
+                if "youtube.com" in line:
                     query = line.split("v=")[-1]
                     await buscar_y_descargar(query, chat_id, context)
                     break
@@ -183,7 +183,15 @@ async def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("✅ Bot iniciado. Esperando mensajes...")
-    await app.run_polling()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(main())
+        loop.run_forever()
+    except KeyboardInterrupt:
+        print("🛑 Bot detenido por el usuario.")
