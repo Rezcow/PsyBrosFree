@@ -1,3 +1,4 @@
+
 import os
 import subprocess
 import re
@@ -53,22 +54,25 @@ async def obtener_teclado_odesli(original_url: str):
         return None
 
 async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
-    filename = os.path.join(DOWNLOADS_DIR, f"{query}.mp3")
     try:
-        subprocess.run([
+        result = subprocess.run([
             "yt-dlp",
             f"ytsearch1:{query}",
             "--extract-audio",
             "--audio-format", "mp3",
-            "-o", filename
-        ], check=True)
+            "-o", f"{DOWNLOADS_DIR}/%(title)s.%(ext)s"
+        ], capture_output=True, text=True)
 
-        with open(filename, 'rb') as audio_file:
-            await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
+        match = re.search(r"\[download\]\s+Destination:\s+(.*\.mp3)", result.stdout)
+        if match:
+            filepath = match.group(1)
+            with open(filepath, 'rb') as audio_file:
+                await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
+            await manejar_eliminacion_segura(filepath)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo encontrar archivo MP3.")
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo descargar: {query}")
-    finally:
-        await manejar_eliminacion_segura(filename)
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo descargar: {query}\n{e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -88,15 +92,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "spotify.com/track" in url:
         try:
             await update.message.reply_text("🎧 Buscando canción...")
-            result = subprocess.run(["yt-dlp", "-j", url], capture_output=True, text=True)
-            data = json.loads(result.stdout)
-            title = data.get("title")
-            if title:
-                await buscar_y_descargar(title, chat_id, context)
+            result = subprocess.run(["spotdl", "--name", url], capture_output=True, text=True)
+            lines = result.stdout.splitlines()
+            song_title = ""
+            for line in lines:
+                if "Title:" in line:
+                    song_title = line.split("Title:")[1].strip()
+                    break
+            if song_title:
+                await buscar_y_descargar(song_title, chat_id, context)
             else:
                 await update.message.reply_text("❌ No se pudo obtener el título de la canción.")
         except Exception as e:
-            await update.message.reply_text(f"❌ No se pudo procesar URL Spotify: {str(e)}")
+            await update.message.reply_text(f"❌ Error Spotify: {str(e)}")
 
     elif "youtu" in url:
         filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
