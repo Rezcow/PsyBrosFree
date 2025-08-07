@@ -1,5 +1,4 @@
-
-import os
+import os 
 import subprocess
 import asyncio
 import re
@@ -38,7 +37,6 @@ async def obtener_teclado_odesli(original_url: str):
                 return None
             data = response.json()
             links = data.get("linksByPlatform", {})
-
             botones, fila = [], []
             for i, (nombre, info) in enumerate(links.items()):
                 url = info.get("url")
@@ -74,24 +72,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = extraer_url(text)
     await update.message.reply_text("🔎 Procesando...")
-
-    # Botones equivalentes
     teclado = await obtener_teclado_odesli(url)
     if teclado:
         await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
 
     if "spotify.com/track" in url:
         try:
-            await update.message.reply_text("🎧 Buscandoando...")
-            result = subprocess.run(["yt-dlp", "-j", url], capture_output=True, text=True)
+            await update.message.reply_text("🎧 Buscando...")
+            result = subprocess.run(["spotdl", url, "--json"], capture_output=True, text=True)
             data = json.loads(result.stdout)
-            title = data.get("title")
+            title = data.get("name") or data.get("title")
             if title:
                 await buscar_y_descargar(title, chat_id, context)
             else:
-                await update.message.reply_text("❌ No se pudo.")
+                await update.message.reply_text("❌ No se pudo obtener título desde Spotify.")
         except Exception as e:
-            await update.message.reply_text(f"❌ No se pudo procesar URL Spotify.{str(e)}")
+            await update.message.reply_text(f"❌ Error Spotify: {str(e)}")
 
     elif "youtu" in url:
         filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
