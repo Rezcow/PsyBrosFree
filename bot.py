@@ -1,7 +1,5 @@
-
 import os
 import subprocess
-import asyncio
 import re
 import httpx
 import json
@@ -38,6 +36,7 @@ async def obtener_teclado_odesli(original_url: str):
                 return None
             data = response.json()
             links = data.get("linksByPlatform", {})
+
             botones, fila = [], []
             for i, (nombre, info) in enumerate(links.items()):
                 url = info.get("url")
@@ -56,7 +55,14 @@ async def obtener_teclado_odesli(original_url: str):
 async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
     filename = os.path.join(DOWNLOADS_DIR, f"{query}.mp3")
     try:
-        subprocess.run(["yt-dlp", f"ytsearch1:{query}", "--extract-audio", "--audio-format", "mp3", "-o", filename], check=True)
+        subprocess.run([
+            "yt-dlp",
+            f"ytsearch1:{query}",
+            "--extract-audio",
+            "--audio-format", "mp3",
+            "-o", filename
+        ], check=True)
+
         with open(filename, 'rb') as audio_file:
             await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
     except Exception as e:
@@ -73,22 +79,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = extraer_url(text)
     await update.message.reply_text("🔎 Procesando...")
+
+    # Mostrar botones equivalentes (Odesli)
     teclado = await obtener_teclado_odesli(url)
     if teclado:
         await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
 
     if "spotify.com/track" in url:
         try:
-            await update.message.reply_text("🎧 Buscando ...")
+            await update.message.reply_text("🎧 Buscando canción...")
             result = subprocess.run(["yt-dlp", "-j", url], capture_output=True, text=True)
             data = json.loads(result.stdout)
             title = data.get("title")
             if title:
                 await buscar_y_descargar(title, chat_id, context)
             else:
-                await update.message.reply_text("❌ No se pudo obtener el título.")
+                await update.message.reply_text("❌ No se pudo obtener el título de la canción.")
         except Exception as e:
-            await update.message.reply_text(f"❌ Error procesando Spotify: {str(e)}")
+            await update.message.reply_text(f"❌ No se pudo procesar URL Spotify: {str(e)}")
 
     elif "youtu" in url:
         filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
@@ -113,22 +121,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ SoundCloud error: {e}")
 
-    elif "instagram.com" in url or "twitter.com" in url or "x.com" in url:
-        filename = os.path.join(DOWNLOADS_DIR, "social.mp4")
+    elif "instagram.com" in url:
+        filename = os.path.join(DOWNLOADS_DIR, "insta.mp4")
         try:
             subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
             with open(filename, 'rb') as f:
                 await context.bot.send_video(chat_id=chat_id, video=f)
         except Exception as e:
-            await update.message.reply_text(f"❌ Error descargando video: {e}")
+            await update.message.reply_text(f"❌ Instagram error: {e}")
         finally:
             await manejar_eliminacion_segura(filename)
 
-async def main():
+    elif "twitter.com" in url or "x.com" in url:
+        filename = os.path.join(DOWNLOADS_DIR, "x.mp4")
+        try:
+            subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
+            with open(filename, 'rb') as f:
+                await context.bot.send_video(chat_id=chat_id, video=f)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Twitter/X error: {e}")
+        finally:
+            await manejar_eliminacion_segura(filename)
+
+# ---- Punto de entrada principal ----
+
+if __name__ == "__main__":
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("✅ Bot listo. Esperando mensajes...")
-    await app.run_polling()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    app.run_polling()
