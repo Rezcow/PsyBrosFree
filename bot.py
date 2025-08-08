@@ -10,38 +10,6 @@ from spotipy.oauth2 import SpotifyClientCredentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-# -- INSTALOADER setup --
-from instaloader import Instaloader, Post
-import requests
-
-INSTAGRAM_USERNAME = os.environ.get("INSTAGRAM_USERNAME") or "TUNOMBRE"
-INSTAGRAM_PASSWORD = os.environ.get("INSTAGRAM_PASSWORD") or "TUPASSWORD"
-
-_loader = None
-
-def get_instaloader():
-    global _loader
-    if _loader is None:
-        _loader = Instaloader()
-        SESSION_FILE = f"session-{INSTAGRAM_USERNAME}"
-        if os.path.exists(SESSION_FILE):
-            _loader.load_session_from_file(INSTAGRAM_USERNAME, filename=SESSION_FILE)
-        else:
-            _loader.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-            _loader.save_session_to_file(SESSION_FILE)
-    return _loader
-
-def fetch_instagram_media_instaloader(instagram_post_url):
-    match = re.search(r"instagram\.com/(?:p|reel|tv)/([^/?#&]+)", instagram_post_url)
-    if not match:
-        return None
-    shortcode = match.group(1)
-    loader = get_instaloader()
-    post = Post.from_shortcode(loader.context, shortcode)
-    return post.video_url if post.is_video else post.url
-
-# -- FIN INSTALOADER setup --
-
 BOT_TOKEN = "8194406693:AAEaxgwVWdQIRjZNUBcal3ttnqCtjfja3Ek"
 SPOTIPY_CLIENT_ID = "a767e61138d6431abd23fa1b68dabcf5"
 SPOTIPY_CLIENT_SECRET = "64841836406d43c6887124df8e064ceb"
@@ -352,26 +320,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             with open(filename, 'rb') as f:
                 await context.bot.send_video(chat_id=chat_id, video=f)
-        except Exception as yt_e:
-            # Fallback a Instaloader solo si yt-dlp falla
-            try:
-                media_url = fetch_instagram_media_instaloader(url)
-                if not media_url:
-                    raise Exception("No se pudo obtener el media_url")
-                fallback_file = os.path.join(DOWNLOADS_DIR, f"ig_fallback_{file_id}.mp4")
-                resp = requests.get(media_url, stream=True)
-                with open(fallback_file, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=1024):
-                        f.write(chunk)
-                with open(fallback_file, 'rb') as f:
-                    await context.bot.send_video(chat_id=chat_id, video=f)
-                await manejar_eliminacion_segura(fallback_file)
-            except Exception as insta_e:
-                await update.message.reply_text(
-                    f"❌ Instagram error al descargar:\n\n"
-                    f"yt-dlp: {yt_e}\n\n"
-                    f"Instaloader: {insta_e}"
-                )
+        except subprocess.CalledProcessError as e:
+            err_msg = (f"❌ Instagram error al descargar:\n"
+                       f"STDERR:\n{e.stderr[:1500]}\n"
+                       f"STDOUT:\n{e.stdout[:500]}")
+            await update.message.reply_text(err_msg)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Instagram error inesperado: {e}")
         finally:
             await manejar_eliminacion_segura(filename)
             try: await procesando_msg.delete()
@@ -432,4 +387,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with open(filename, 'rb') as f:
                     await context.bot.send_video(chat_id=int(chat_id), video=f)
             except Exception as e:
-                await context.bot.send_message
+                await context.bot.send_message(chat_id=int(chat_id), text=f"❌ YouTube error: {e}")
+            finally:
+                await manejar_eliminacion_segura(filename)
+                try: await descargando_msg.delete()
+                except: pass
+
+        elif tipo == "ytaudio":
+            meta = await obtener_metadatos_general(url)
+            query_txt = (meta.get("title") if meta else None) or url
+            descargando_msg = await context.bot.send_message(chat_id=int(chat_id), text=f"Descargando: {query_txt}")
+            await buscar_y_descargar(query_txt, int(chat_id), context, meta=meta)
+            try: await descargando_msg.delete()
+            except: pass
+
+        pending_youtube_links.pop(link_id, None)
+
+if __name__ == "__main__":
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    print("✅ Bot listo. Esperando mensajes...")
+    app.run_polling()
