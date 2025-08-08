@@ -39,7 +39,7 @@ async def obtener_teclado_odesli(original_url: str):
             data = response.json()
             links = data.get("linksByPlatform", {})
             botones, fila = [], []
-            for i, (nombre, info) in enumerate(links.items()):
+            for _, (nombre, info) in enumerate(links.items()):
                 url = info.get("url")
                 if url:
                     fila.append(InlineKeyboardButton(text=nombre.capitalize(), url=url))
@@ -54,6 +54,7 @@ async def obtener_teclado_odesli(original_url: str):
         return None
 
 async def obtener_metadatos_general(url: str):
+    # 1) Intento por OpenGraph
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         async with httpx.AsyncClient() as client:
@@ -72,6 +73,7 @@ async def obtener_metadatos_general(url: str):
     except Exception as e:
         print(f"[SCRAPE] Error: {e}")
 
+    # 2) Fallback por Odesli
     api_url = f"https://api.song.link/v1-alpha.1/links?url={url}"
     try:
         async with httpx.AsyncClient() as client:
@@ -91,6 +93,24 @@ async def obtener_metadatos_general(url: str):
         print(f"Odesli error: {e}")
     return None
 
+def obtener_metadatos_spotify_track(track_url):
+    sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+        client_id=SPOTIPY_CLIENT_ID,
+        client_secret=SPOTIPY_CLIENT_SECRET
+    ))
+    match = re.search(r"track/([a-zA-Z0-9]+)", track_url)
+    if not match:
+        return None
+    track_id = match.group(1)
+    try:
+        track = sp.track(track_id)
+        title = track["name"]
+        artists = ", ".join([a["name"] for a in track["artists"]])
+        return f"{title} {artists}"
+    except Exception as e:
+        print(f"[Spotify Track] Error: {e}")
+        return None
+
 async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
     sanitized = re.sub(r'[\\/*?:"<>|]', "", query)
     output_path = os.path.join(DOWNLOADS_DIR, f"{sanitized}.mp3")
@@ -108,6 +128,9 @@ async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_
             with open(output_path, 'rb') as audio_file:
                 await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
         else:
+            # Log para diagnóstico
+            print(proc.stdout)
+            print(proc.stderr)
             await context.bot.send_message(chat_id=chat_id, text="❌ No se generó archivo de audio.")
     except Exception as e:
         if "Timed out" not in str(e):
@@ -142,8 +165,6 @@ def detectar_plataforma(url: str):
         return "youtube"
     if "soundcloud.com" in url:
         return "soundcloud"
-    if "instagram.com" in url:
-        return "instagram"
     if "twitter.com" in url or "x.com" in url:
         return "twitter"
     return "desconocido"
@@ -165,13 +186,13 @@ def obtener_tracks_album_spotify(album_url):
     album_name = None
     try:
         album = sp.album(album_id)
-        album_name = album['name']
+        album_name = album["name"]
         if album.get("images"):
             cover_url = album["images"][0]["url"]
-        for item in album['tracks']['items']:
-            title = item['name']
-            artists = [a['name'] for a in item['artists']]
-            track_number = item.get('track_number', None)
+        for item in album["tracks"]["items"]:
+            title = item["name"]
+            artists = [a["name"] for a in item["artists"]]
+            track_number = item.get("track_number", None)
             if track_number is not None:
                 track_num_str = f"{track_number:02d}"
                 track_query = f"{track_num_str} - {title} {', '.join(artists)}"
@@ -210,33 +231,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ]
         reply_markup = InlineKeyboardMarkup(botones)
-        await update.message.reply_text(
-            "¿Qué formato deseas recibir?",
-            reply_markup=reply_markup
-        )
+        await update.message.reply_text("¿Qué formato deseas recibir?", reply_markup=reply_markup)
         try: await procesando_msg.delete()
         except: pass
         return
 
-    # TRACKS: Spotify, Apple Music, YouTube Music (audio)
-    if plataforma in ["spotify_track", "apple_song", "youtube_music"]:
-        query = await obtener_metadatos_general(url)
-        if not query:
-            await context.bot.send_message(chat_id=chat_id, text="❌ No se pudo extraer título/artista.")
+    # TRACKS
+    if plataforma == "spotify_track":
+        query_txt = obtener_metadatos_spotify_track(url)
+        if not query_txt:
+            await context.bot.send_message(chat_id=chat_id, text="❌ No se pudo extraer título/artista de Spotify.")
             try: await procesando_msg.delete()
             except: pass
             return
-
-        descargando_msg = await context.bot.send_message(chat_id=chat_id, text=f"Descargando: {query}")
-        await buscar_y_descargar(query, chat_id, context)
+        descargando_msg = await context.bot.send_message(chat_id=chat_id, text=f"Descargando: {query_txt}")
+        await buscar_y_descargar(query_txt, chat_id, context)
         try: await procesando_msg.delete()
         except: pass
         try: await descargando_msg.delete()
         except: pass
         return
 
-    # ALBUMES SPOTIFY (carátula primero)
-    elif plataforma == "spotify_album":
+    if plataforma in ["apple_song", "youtube_music"]:
+        query_txt = await obtener_metadatos_general(url)
+        if not query_txt:
+            await context.bot.send_message(chat_id=chat_id, text="❌ No se pudo extraer título/artista.")
+            try: await procesando_msg.delete()
+            except: pass
+            return
+        descargando_msg = await context.bot.send_message(chat_id=chat_id, text=f"Descargando: {query_txt}")
+        await buscar_y_descargar(query_txt, chat_id, context)
+        try: await procesando_msg.delete()
+        except: pass
+        try: await descargando_msg.delete()
+        except: pass
+        return
+
+    # ÁLBUMES SPOTIFY (envía carátula primero)
+    if plataforma == "spotify_album":
         album_msg = await context.bot.send_message(chat_id=chat_id, text="⏳ Descargando álbum, esto puede tardar varios minutos...")
         tracks, cover_url, album_name = obtener_tracks_album_spotify(url)
         if not tracks:
@@ -265,21 +297,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await album_msg.delete()
         except: pass
 
-        for idx, query in enumerate(tracks, 1):
+        for idx, q in enumerate(tracks, 1):
             try:
-                descargando_msg = await context.bot.send_message(chat_id=chat_id, text=f"🎵 [{idx}/{len(tracks)}] Descargando: {query}")
-                await buscar_y_descargar(query, chat_id, context)
+                descargando_msg = await context.bot.send_message(chat_id=chat_id, text=f"🎵 [{idx}/{len(tracks)}] Descargando: {q}")
+                await buscar_y_descargar(q, chat_id, context)
                 try: await descargando_msg.delete()
                 except: pass
             except Exception as e:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Error con la canción {query}: {e}")
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Error con la canción {q}: {e}")
 
         await context.bot.send_message(chat_id=chat_id, text="✅ Álbum completo enviado.")
         try: await procesando_msg.delete()
         except: pass
         return
 
-    elif plataforma == "soundcloud":
+    # SOUNDCLOUD
+    if plataforma == "soundcloud":
         try:
             subprocess.run(["scdl", "-l", limpiar_url_params(url), "-o", DOWNLOADS_DIR, "-f", "--onlymp3"], check=True)
             for file in os.listdir(DOWNLOADS_DIR):
@@ -293,24 +326,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             try: await procesando_msg.delete()
             except: pass
+        return
 
-    elif plataforma == "instagram":
-        filename = os.path.join(DOWNLOADS_DIR, "insta.mp4")
-        descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
-        try:
-            subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
-            with open(filename, 'rb') as f:
-                await context.bot.send_video(chat_id=chat_id, video=f)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Instagram error: {e}")
-        finally:
-            await manejar_eliminacion_segura(filename)
-            try: await procesando_msg.delete()
-            except: pass
-            try: await descargando_msg.delete()
-            except: pass
-
-    elif plataforma == "twitter":
+    # TWITTER / X
+    if plataforma == "twitter":
         filename = os.path.join(DOWNLOADS_DIR, "x.mp4")
         descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
         try:
@@ -325,18 +344,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             try: await descargando_msg.delete()
             except: pass
+        return
 
-    else:
-        await context.bot.send_message(chat_id=chat_id, text="Enlace no soportado aún.")
-        try: await procesando_msg.delete()
-        except: pass
+    # No soportado
+    await context.bot.send_message(chat_id=chat_id, text="Enlace no soportado aún.")
+    try: await procesando_msg.delete()
+    except: pass
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    # Solo recibe el link_id y el chat_id
     if data.startswith("ytvideo|") or data.startswith("ytaudio|"):
         tipo, link_id, chat_id = data.split("|", 2)
         url = pending_youtube_links.get(link_id)
