@@ -294,39 +294,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: await procesando_msg.delete()
             except: pass
 
-    # === INSTAGRAM (solo esta parte modificada) ===
     elif plataforma == "instagram":
-        # Plantilla que permite cualquier extensión (foto, video o ítems de carrusel)
-        out_tpl = os.path.join(DOWNLOADS_DIR, "insta.%(ext)s")
-        descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando desde Instagram...")
+        filename = os.path.join(DOWNLOADS_DIR, "insta.mp4")
+        descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
         try:
-            # No forzamos mp4, y soporta carrusel
-            subprocess.run(["yt-dlp", "-o", out_tpl, url, "--no-playlist"], check=True)
-
-            # Buscar SOLO archivos que empiecen con 'insta.' (evita tocar otros)
-            candidates = sorted([f for f in os.listdir(DOWNLOADS_DIR) if f.startswith("insta.")])
-            if not candidates:
-                raise RuntimeError("No se descargó ningún archivo")
-
-            for file in candidates:
-                path = os.path.join(DOWNLOADS_DIR, file)
-                ext = os.path.splitext(file)[1].lower()
-                try:
-                    if ext in [".mp4", ".mov", ".m4v", ".webm"]:
-                        with open(path, 'rb') as f:
-                            await context.bot.send_video(chat_id=chat_id, video=f)
-                    elif ext in [".jpg", ".jpeg", ".png", ".webp"]:
-                        with open(path, 'rb') as f:
-                            await context.bot.send_photo(chat_id=chat_id, photo=f)
-                    else:
-                        # Cualquier otro formato, lo enviamos como documento
-                        with open(path, 'rb') as f:
-                            await context.bot.send_document(chat_id=chat_id, document=f)
-                finally:
-                    await manejar_eliminacion_segura(path)
+            subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
+            with open(filename, 'rb') as f:
+                await context.bot.send_video(chat_id=chat_id, video=f)
         except Exception as e:
             await update.message.reply_text(f"❌ Instagram error: {e}")
         finally:
+            await manejar_eliminacion_segura(filename)
             try: await procesando_msg.delete()
             except: pass
             try: await descargando_msg.delete()
