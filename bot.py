@@ -16,7 +16,6 @@ SPOTIPY_CLIENT_SECRET = "64841836406d43c6887124df8e064ceb"
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# Diccionario para asociar el UUID al link real de YouTube
 pending_youtube_links = {}
 
 def limpiar_url_params(url: str) -> str:
@@ -62,13 +61,25 @@ async def obtener_metadatos_general(url: str):
                 soup = BeautifulSoup(r.text, "html.parser")
                 title = (soup.find("meta", property="og:title") or {}).get("content", "").strip()
                 desc = (soup.find("meta", property="og:description") or {}).get("content", "").strip()
+                image = (soup.find("meta", property="og:image") or {}).get("content", "").strip()
+                album = None
+                year = None
                 artist = None
                 if desc:
-                    artist = desc.split("•")[0].strip()
-                if title and artist:
-                    return f"{title} {artist}"
-                elif title:
-                    return title
+                    parts = [p.strip() for p in desc.split("•")]
+                    if len(parts) > 0:
+                        artist = parts[0]
+                    if len(parts) > 1:
+                        album = parts[1]
+                    if len(parts) > 2:
+                        year = parts[2][:4]
+                return {
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "year": year,
+                    "cover_url": image
+                }
     except Exception as e:
         print(f"[SCRAPE] Error: {e}")
 
@@ -83,17 +94,27 @@ async def obtener_metadatos_general(url: str):
             entity = data.get("entitiesByUniqueId", {}).get(uid, {}) if uid else {}
             title = entity.get("title")
             artist = entity.get("artistName")
-            if title and artist:
-                return f"{title} {artist}"
-            elif title:
-                return title
+            album = entity.get("albumName")
+            year = entity.get("releaseDate")
+            cover_url = entity.get("thumbnailUrl")
+            if year:
+                year = year[:4]
+            return {
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "year": year,
+                "cover_url": cover_url
+            }
     except Exception as e:
         print(f"Odesli error: {e}")
     return None
 
-async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
+async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE, meta=None):
     sanitized = re.sub(r'[\\/*?:"<>|]', "", query)
     output_path = os.path.join(DOWNLOADS_DIR, f"{sanitized}.mp3")
+    thumb_path = None
+    caption = None
     try:
         proc = subprocess.run([
             "yt-dlp",
@@ -104,9 +125,44 @@ async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_
             "-o", output_path
         ], capture_output=True, text=True)
 
+        if meta:
+            caption = ""
+            if meta.get("artist"):
+                caption += f"{meta['artist']} - "
+            caption += f"{meta.get('title') or query}\n"
+            if meta.get("album"):
+                caption += f"Álbum: {meta['album']}"
+                if meta.get("year"):
+                    caption += f" ({meta['year']})"
+                caption += "\n"
+            if meta.get("cover_url"):
+                try:
+                    thumb_path = os.path.join(DOWNLOADS_DIR, "thumb.jpg")
+                    async with httpx.AsyncClient() as client:
+                        r = await client.get(meta["cover_url"])
+                        with open(thumb_path, "wb") as img:
+                            img.write(r.content)
+                except Exception as e:
+                    print(f"[Cover Download] Error: {e}")
+
         if os.path.exists(output_path):
             with open(output_path, 'rb') as audio_file:
-                await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
+                if thumb_path and os.path.exists(thumb_path):
+                    with open(thumb_path, 'rb') as thumb_file:
+                        await context.bot.send_audio(
+                            chat_id=chat_id,
+                            audio=audio_file,
+                            title=meta.get('title') if meta else query,
+                            caption=caption,
+                            thumb=thumb_file
+                        )
+                else:
+                    await context.bot.send_audio(
+                        chat_id=chat_id,
+                        audio=audio_file,
+                        title=meta.get('title') if meta else query,
+                        caption=caption,
+                    )
         else:
             await context.bot.send_message(chat_id=chat_id, text="❌ No se generó archivo de audio.")
     except Exception as e:
@@ -114,20 +170,8 @@ async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_
             await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo descargar: {query} ({e})")
     finally:
         await manejar_eliminacion_segura(output_path)
-
-async def descargar_video_youtube(url: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
-    filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
-    descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
-    try:
-        subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
-        with open(filename, 'rb') as f:
-            await context.bot.send_video(chat_id=chat_id, video=f)
-    except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ YouTube error: {e}")
-    finally:
-        await manejar_eliminacion_segura(filename)
-        try: await descargando_msg.delete()
-        except: pass
+        if thumb_path and os.path.exists(thumb_path):
+            await manejar_eliminacion_segura(thumb_path)
 
 def detectar_plataforma(url: str):
     if "spotify.com" in url and "/track/" in url:
@@ -218,17 +262,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
         return
 
-    # TRACKS: Spotify, Apple Music, YouTube Music (audio)
-    if plataforma in ["spotify_track", "apple_song", "youtube_music"]:
-        query = await obtener_metadatos_general(url)
-        if not query:
-            await context.bot.send_message(chat_id=chat_id, text="❌ No se pudo extraer título/artista.")
-            try: await procesando_msg.delete()
-            except: pass
-            return
-
+    # TRACKS: Spotify, Apple Music, YouTube Music, YouTube (audio universal)
+    if plataforma in ["spotify_track", "apple_song", "youtube_music", "youtube"]:
+        meta = await obtener_metadatos_general(url)
+        query = (meta.get("title") if meta else None) or url
         descargando_msg = await context.bot.send_message(chat_id=chat_id, text=f"Descargando: {query}")
-        await buscar_y_descargar(query, chat_id, context)
+        await buscar_y_descargar(query, chat_id, context, meta=meta)
         try: await procesando_msg.delete()
         except: pass
         try: await descargando_msg.delete()
@@ -295,14 +334,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
 
     elif plataforma == "instagram":
-        filename = os.path.join(DOWNLOADS_DIR, "insta.mp4")
+        file_id = str(uuid.uuid4())[:8]
+        filename = os.path.join(DOWNLOADS_DIR, f"insta_{file_id}.mp4")
         descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
+        cmd = [
+            "yt-dlp", "-f", "mp4",
+            "-o", filename,
+            url
+        ]
         try:
-            subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             with open(filename, 'rb') as f:
                 await context.bot.send_video(chat_id=chat_id, video=f)
+        except subprocess.CalledProcessError as e:
+            err_msg = (f"❌ Instagram error al descargar:\n"
+                       f"STDERR:\n{e.stderr[:1500]}\n"
+                       f"STDOUT:\n{e.stdout[:500]}")
+            await update.message.reply_text(err_msg)
         except Exception as e:
-            await update.message.reply_text(f"❌ Instagram error: {e}")
+            await update.message.reply_text(f"❌ Instagram error inesperado: {e}")
         finally:
             await manejar_eliminacion_segura(filename)
             try: await procesando_msg.delete()
@@ -311,14 +361,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
 
     elif plataforma == "twitter":
-        filename = os.path.join(DOWNLOADS_DIR, "x.mp4")
+        file_id = str(uuid.uuid4())[:8]
+        filename = os.path.join(DOWNLOADS_DIR, f"x_{file_id}.mp4")
         descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
+        cmd = [
+            "yt-dlp", "-f", "mp4",
+            "-o", filename,
+            url
+        ]
         try:
-            subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             with open(filename, 'rb') as f:
                 await context.bot.send_video(chat_id=chat_id, video=f)
+        except subprocess.CalledProcessError as e:
+            err_msg = (f"❌ Twitter/X error al descargar:\n"
+                       f"STDERR:\n{e.stderr[:1500]}\n"
+                       f"STDOUT:\n{e.stdout[:500]}")
+            await update.message.reply_text(err_msg)
         except Exception as e:
-            await update.message.reply_text(f"❌ Twitter/X error: {e}")
+            await update.message.reply_text(f"❌ Twitter/X error inesperado: {e}")
         finally:
             await manejar_eliminacion_segura(filename)
             try: await procesando_msg.delete()
@@ -336,7 +397,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    # Solo recibe el link_id y el chat_id
     if data.startswith("ytvideo|") or data.startswith("ytaudio|"):
         tipo, link_id, chat_id = data.split("|", 2)
         url = pending_youtube_links.get(link_id)
@@ -345,7 +405,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if tipo == "ytvideo":
-            filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
+            file_id = str(uuid.uuid4())[:8]
+            filename = os.path.join(DOWNLOADS_DIR, f"youtube_{file_id}.mp4")
             descargando_msg = await context.bot.send_message(chat_id=int(chat_id), text="Descargando video...")
             try:
                 subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
@@ -359,16 +420,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
 
         elif tipo == "ytaudio":
-            query_txt = await obtener_metadatos_general(url)
-            if not query_txt:
-                await context.bot.send_message(chat_id=int(chat_id), text="❌ No se pudo extraer título/artista.")
-                return
+            meta = await obtener_metadatos_general(url)
+            query_txt = (meta.get("title") if meta else None) or url
             descargando_msg = await context.bot.send_message(chat_id=int(chat_id), text=f"Descargando: {query_txt}")
-            await buscar_y_descargar(query_txt, int(chat_id), context)
+            await buscar_y_descargar(query_txt, int(chat_id), context, meta=meta)
             try: await descargando_msg.delete()
             except: pass
 
-        # Limpia el link de memoria
         pending_youtube_links.pop(link_id, None)
 
 if __name__ == "__main__":
