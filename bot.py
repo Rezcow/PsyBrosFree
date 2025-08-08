@@ -27,7 +27,7 @@ from telegram.ext import Application, MessageHandler, CallbackQueryHandler, Cont
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SPOTIPY_CLIENT_ID = os.environ["SPOTIPY_CLIENT_ID"]
 SPOTIPY_CLIENT_SECRET = os.environ["SPOTIPY_CLIENT_SECRET"]
-INSTAGRAM_SESSIONID = os.environ.get("INSTAGRAM_SESSIONID")  # cookie de sesión IG (opcional pero recomendada)
+INSTAGRAM_SESSIONID = os.environ.get("INSTAGRAM_SESSIONID")  # cookie de sesión IG (opcional)
 
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
@@ -211,9 +211,10 @@ def obtener_tracks_album_spotify(album_url):
 async def descargar_instagram_con_instaloader(url: str, outdir: str):
     """
     Descarga el/los medios de un post de Instagram usando Instaloader.
-    Devuelve una lista de dicts: [{"path": str, "type": "photo"|"video"}] o [] si falla.
+    Devuelve una lista: [{"path": str, "type": "photo"|"video"}] o [] si falla.
     """
     if instaloader is None:
+        print("[Instaloader] no instalado — agrega 'instaloader' a requirements.txt")
         return []
 
     m = re.search(r"instagram\.com/(?:reel|p|tv)/([A-Za-z0-9_-]+)", url)
@@ -380,7 +381,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif plataforma == "instagram":
         tmp_id = str(uuid.uuid4())[:8]
         filename = os.path.join(DOWNLOADS_DIR, f"insta_{tmp_id}.mp4")
-        descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
+        descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando media de Instagram...")
+        debug_steps = []
 
         def build_args(target_url: str):
             ua = random.choice(USER_AGENTS)
@@ -398,34 +400,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 args.extend(["--add-header", f"Cookie: sessionid={INSTAGRAM_SESSIONID}"])
             return args
 
-        async def intentar_con_ytdlp(u: str):
+        async def intentar_con_ytdlp(u: str, outfile: str):
             try:
                 proc = subprocess.run(build_args(u), capture_output=True, text=True)
-                if proc.returncode != 0:
-                    return False, proc.stderr.strip()[:4000]
-                return os.path.exists(filename), None
+                exists_ok = os.path.exists(outfile) and os.path.getsize(outfile) > 0
+                if proc.returncode != 0 or not exists_ok:
+                    err = (proc.stderr or "").strip()
+                    try:
+                        if os.path.exists(outfile) and os.path.getsize(outfile) == 0:
+                            os.remove(outfile)
+                    except:
+                        pass
+                    return False, err[:4000]
+                return True, None
             except Exception as e:
                 return False, str(e)
 
-        ok, err = await intentar_con_ytdlp(url)
+        # 1) yt-dlp directo
+        ok, err = await intentar_con_ytdlp(url, filename)
+        debug_steps.append(f"yt-dlp: {'OK' if ok else 'FAIL'}")
 
-        # Fallback 2: ddinstagram con yt-dlp
+        # 2) ddinstagram con yt-dlp
         if not ok and "instagram.com" in url:
             alt = url.replace("instagram.com", "ddinstagram.com")
-            ok2, err2 = await intentar_con_ytdlp(alt)
+            ok2, err2 = await intentar_con_ytdlp(alt, filename)
+            debug_steps.append(f"ddinstagram: {'OK' if ok2 else 'FAIL'}")
             if ok2:
                 ok, err = ok2, None
             else:
                 err = (err or "") + ("\n" + (err2 or ""))
 
-        # Fallback 3: Instaloader (fotos/carrusel/video)
+        # 3) Instaloader (fotos/carrusel/video)
         used_instaloader = False
         ig_media = []
         if not ok:
-            ig_media = await descargar_instagram_con_instaloader(url, DOWNLOADS_DIR)
-            if ig_media:
-                used_instaloader = True
-                ok = True  # ya tenemos algo para enviar
+            if instaloader is None:
+                debug_steps.append("instaloader: NOT_INSTALLED")
+            else:
+                ig_media = await descargar_instagram_con_instaloader(url, DOWNLOADS_DIR)
+                used_instaloader = bool(ig_media)
+                debug_steps.append(f"instaloader: {'OK' if used_instaloader else 'FAIL'}")
+                if used_instaloader:
+                    ok = True
 
         try:
             if ok and not used_instaloader and os.path.exists(filename):
@@ -457,7 +473,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 hint = ""
                 if err and any(k in err.lower() for k in ["login", "private", "login required", "forbidden", "not available"]):
                     hint = "\n⚠️ Tip: agrega/actualiza INSTAGRAM_SESSIONID en variables de entorno."
-                await update.message.reply_text(f"❌ Instagram error.\n{(err or 'Sin detalle')[:700]}{hint}")
+                steps = " · ".join(debug_steps) if debug_steps else "no-steps"
+                await update.message.reply_text(f"❌ Instagram error.\nRutas: {steps}\n{(err or 'Sin detalle')[:700]}{hint}")
 
         finally:
             # Limpieza de archivos temporales
