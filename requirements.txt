@@ -1,5 +1,5 @@
 python-telegram-bot==20.7
-yt-dlp
+yt-dlp>=2025.07.21
 spotipy
 httpx
 beautifulsoup4
