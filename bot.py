@@ -142,10 +142,10 @@ def detectar_plataforma(url: str):
         return "youtube"
     if "soundcloud.com" in url:
         return "soundcloud"
-    if "twitter.com" in url or "x.com" in url:
-        return "twitter"
     if "instagram.com" in url:
         return "instagram"
+    if "twitter.com" in url or "x.com" in url:
+        return "twitter"
     return "desconocido"
 
 def obtener_tracks_album_spotify(album_url):
@@ -294,6 +294,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: await procesando_msg.delete()
             except: pass
 
+    elif plataforma == "instagram":
+        filename = os.path.join(DOWNLOADS_DIR, "insta.mp4")
+        descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
+        try:
+            subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
+            with open(filename, 'rb') as f:
+                await context.bot.send_video(chat_id=chat_id, video=f)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Instagram error: {e}")
+        finally:
+            await manejar_eliminacion_segura(filename)
+            try: await procesando_msg.delete()
+            except: pass
+            try: await descargando_msg.delete()
+            except: pass
+
     elif plataforma == "twitter":
         filename = os.path.join(DOWNLOADS_DIR, "x.mp4")
         descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
@@ -309,12 +325,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             try: await descargando_msg.delete()
             except: pass
-
-    elif plataforma == "instagram":
-        await context.bot.send_message(chat_id=chat_id, text="ℹ️ Instagram no está soportado por ahora.")
-        try: await procesando_msg.delete()
-        except: pass
-        return
 
     else:
         await context.bot.send_message(chat_id=chat_id, text="Enlace no soportado aún.")
