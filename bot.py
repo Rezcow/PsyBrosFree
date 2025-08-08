@@ -432,6 +432,4 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with open(filename, 'rb') as f:
                     await context.bot.send_video(chat_id=int(chat_id), video=f)
             except Exception as e:
-                await context.bot.send_message(chat_id=int(chat_id), text=f"❌ YouTube error: {e}")
-            finally:
-                await manejar
+                await context.bot.send_message
