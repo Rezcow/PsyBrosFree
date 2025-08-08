@@ -10,9 +10,9 @@ from spotipy.oauth2 import SpotifyClientCredentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-SPOTIPY_CLIENT_ID = os.environ["SPOTIPY_CLIENT_ID"]
-SPOTIPY_CLIENT_SECRET = os.environ["SPOTIPY_CLIENT_SECRET"]
+BOT_TOKEN = "8194406693:AAEaxgwVWdQIRjZNUBcal3ttnqCtjfja3Ek"
+SPOTIPY_CLIENT_ID = "a767e61138d6431abd23fa1b68dabcf5"
+SPOTIPY_CLIENT_SECRET = "64841836406d43c6887124df8e064ceb"
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
