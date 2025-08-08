@@ -296,112 +296,108 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # === INSTAGRAM (solo esta parte modificada) ===
     # === INSTAGRAM (nuevo) ===
+    # === INSTAGRAM (scraping sin session) ===
     elif plataforma == "instagram":
         descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando desde Instagram...")
 
-        async def _save(url_src: str, suffix: str) -> str:
-            # Guarda a disco y devuelve ruta
-            fname = f"insta_{uuid.uuid4().hex[:8]}.{suffix}"
+        async def _save(url_src: str) -> str:
+            # Detecta extensión por la URL
+            ext = "bin"
+            if ".mp4" in url_src.lower():
+                ext = "mp4"
+            elif any(x in url_src.lower() for x in [".jpg", ".jpeg"]):
+                ext = "jpg"
+            elif ".png" in url_src.lower():
+                ext = "png"
+            elif ".webp" in url_src.lower():
+                ext = "webp"
+            fname = f"insta_{uuid.uuid4().hex[:8]}.{ext}"
             path = os.path.join(DOWNLOADS_DIR, fname)
             async with httpx.AsyncClient() as client:
-                r = await client.get(url_src, timeout=60)
+                r = await client.get(url_src, timeout=60, headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0 Safari/537.36",
+                    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+                })
                 r.raise_for_status()
                 with open(path, "wb") as f:
                     f.write(r.content)
             return path
 
         try:
-            # 1) Obtener metadatos en JSON (sin descargar archivos)
-            proc = subprocess.run(
-                ["yt-dlp", "-J", "--no-warnings", "--no-playlist", url],
-                capture_output=True, text=True, check=True
-            )
-            import json
-            info = json.loads(proc.stdout)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0 Safari/537.36",
+                "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+            }
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, headers=headers, timeout=30)
+                resp.raise_for_status()
+                html = resp.text
 
-            # 2) Normalizar a lista de entradas (single o carrusel)
-            entries = []
-            if isinstance(info, dict) and "entries" in info and info["entries"]:
-                entries = info["entries"]
-            elif isinstance(info, dict):
-                entries = [info]
-            else:
-                entries = []
+            media_urls = []
 
-            if not entries:
-                raise RuntimeError("No se encontraron elementos descargables.")
+            # 1) og:video (si es video)
+            soup = BeautifulSoup(html, "html.parser")
+            og_video = soup.find("meta", property="og:video")
+            if og_video and og_video.get("content"):
+                media_urls.append(og_video["content"])
+
+            # 2) og:image (foto principal)
+            og_image = soup.find("meta", property="og:image")
+            if og_image and og_image.get("content"):
+                media_urls.append(og_image["content"])
+
+            # 3) Buscar JSON incrustado: "video_url":"..." y "display_url":"..."
+            # Esto suele cubrir carruseles (sidecar)
+            import re
+            video_urls = re.findall(r'"video_url":"(https:\\/\\/[^"]+?)"', html)
+            image_urls = re.findall(r'"display_url":"(https:\\/\\/[^"]+?)"', html)
+
+            # Desescape de barras
+            def _clean(u): return u.replace("\\/", "/")
+
+            media_urls.extend(_clean(u) for u in video_urls)
+            media_urls.extend(_clean(u) for u in image_urls)
+
+            # Unificar y mantener orden relativo
+            seen = set()
+            ordered_media = []
+            for u in media_urls:
+                if u not in seen:
+                    seen.add(u)
+                    ordered_media.append(u)
+
+            if not ordered_media:
+                raise RuntimeError("No pude extraer imágenes ni videos de Instagram (post privado o bloqueado).")
 
             enviados = 0
-            for it in entries:
-                # Para fotos IG: suele venir 'url' directa + 'ext' 'jpg'/'webp'
-                # Para videos IG: puede venir 'ext' 'mp4' o 'formats' con variantes
-                url_media = it.get("url")
-                ext = (it.get("ext") or "").lower()
-
-                # Si no hay url directa, intenta elegir el mejor formato de video
-                if not url_media and it.get("formats"):
-                    # Elegir el último (suele ser el mejor)
-                    fmt = [f for f in it["formats"] if f.get("url")] or []
-                    if fmt:
-                        url_media = fmt[-1]["url"]
-                        ext = (fmt[-1].get("ext") or "mp4").lower()
-
-                if not url_media:
-                    # Fallback: intentar descarga directa de yt-dlp
-                    # (soluciona casos raros)
-                    out_tpl = os.path.join(DOWNLOADS_DIR, "insta.%(ext)s")
-                    subprocess.run(["yt-dlp", "-o", out_tpl, url, "--no-playlist"], check=True)
-                    # Enviar todo lo que se generó
-                    from glob import glob
-                    for path in sorted(glob(os.path.join(DOWNLOADS_DIR, "insta.*"))):
-                        try:
-                            if path.lower().endswith((".mp4", ".mov", ".m4v", ".webm")):
-                                with open(path, "rb") as f:
-                                    await context.bot.send_video(chat_id=chat_id, video=f)
-                            elif path.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-                                with open(path, "rb") as f:
-                                    await context.bot.send_photo(chat_id=chat_id, photo=f)
-                            else:
-                                with open(path, "rb") as f:
-                                    await context.bot.send_document(chat_id=chat_id, document=f)
-                            enviados += 1
-                        finally:
-                            await manejar_eliminacion_segura(path)
-                    continue
-
-                # 3) Descargar y enviar según tipo
-                if ext in ("jpg", "jpeg", "png", "webp", "gif"):
-                    path = await _save(url_media, ext)
-                    try:
-                        with open(path, "rb") as f:
-                            await context.bot.send_photo(chat_id=chat_id, photo=f)
-                        enviados += 1
-                    finally:
-                        await manejar_eliminacion_segura(path)
-
-                else:
-                    # Tratar como video por defecto
-                    vext = ext if ext in ("mp4", "mov", "m4v", "webm") else "mp4"
-                    path = await _save(url_media, vext)
-                    try:
+            for murl in ordered_media:
+                path = await _save(murl)
+                try:
+                    if path.lower().endswith((".mp4", ".mov", ".m4v", ".webm")):
                         with open(path, "rb") as f:
                             await context.bot.send_video(chat_id=chat_id, video=f)
-                        enviados += 1
-                    finally:
-                        await manejar_eliminacion_segura(path)
+                    elif path.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                        with open(path, "rb") as f:
+                            await context.bot.send_photo(chat_id=chat_id, photo=f)
+                    else:
+                        with open(path, "rb") as f:
+                            await context.bot.send_document(chat_id=chat_id, document=f)
+                    enviados += 1
+                finally:
+                    await manejar_eliminacion_segura(path)
 
             if enviados == 0:
                 raise RuntimeError("No se pudo enviar ningún elemento de Instagram.")
 
-        except subprocess.CalledProcessError as e:
-            await update.message.reply_text(f"❌ Instagram error (metadatos): {e.stderr or e}")
         except Exception as e:
             await update.message.reply_text(f"❌ Instagram error: {e}")
+
         finally:
             try: await procesando_msg.delete()
             except: pass
             try: await descargando_msg.delete()
             except: pass
+
 
 
     elif plataforma == "twitter":
