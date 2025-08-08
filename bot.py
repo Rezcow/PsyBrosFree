@@ -61,7 +61,6 @@ async def obtener_metadatos_general(url: str):
                 soup = BeautifulSoup(r.text, "html.parser")
                 title = (soup.find("meta", property="og:title") or {}).get("content", "").strip()
                 desc = (soup.find("meta", property="og:description") or {}).get("content", "").strip()
-                image = (soup.find("meta", property="og:image") or {}).get("content", "").strip()
                 album = None
                 year = None
                 artist = None
@@ -77,8 +76,7 @@ async def obtener_metadatos_general(url: str):
                     "title": title,
                     "artist": artist,
                     "album": album,
-                    "year": year,
-                    "cover_url": image
+                    "year": year
                 }
     except Exception as e:
         print(f"[SCRAPE] Error: {e}")
@@ -96,15 +94,13 @@ async def obtener_metadatos_general(url: str):
             artist = entity.get("artistName")
             album = entity.get("albumName")
             year = entity.get("releaseDate")
-            cover_url = entity.get("thumbnailUrl")
             if year:
                 year = year[:4]
             return {
                 "title": title,
                 "artist": artist,
                 "album": album,
-                "year": year,
-                "cover_url": cover_url
+                "year": year
             }
     except Exception as e:
         print(f"Odesli error: {e}")
@@ -113,7 +109,6 @@ async def obtener_metadatos_general(url: str):
 async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE, meta=None):
     sanitized = re.sub(r'[\\/*?:"<>|]', "", query)
     output_path = os.path.join(DOWNLOADS_DIR, f"{sanitized}.mp3")
-    thumb_path = None
     caption = None
     try:
         proc = subprocess.run([
@@ -135,34 +130,15 @@ async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_
                 if meta.get("year"):
                     caption += f" ({meta['year']})"
                 caption += "\n"
-            if meta.get("cover_url"):
-                try:
-                    thumb_path = os.path.join(DOWNLOADS_DIR, "thumb.jpg")
-                    async with httpx.AsyncClient() as client:
-                        r = await client.get(meta["cover_url"])
-                        with open(thumb_path, "wb") as img:
-                            img.write(r.content)
-                except Exception as e:
-                    print(f"[Cover Download] Error: {e}")
 
         if os.path.exists(output_path):
             with open(output_path, 'rb') as audio_file:
-                if thumb_path and os.path.exists(thumb_path):
-                    with open(thumb_path, 'rb') as thumb_file:
-                        await context.bot.send_audio(
-                            chat_id=chat_id,
-                            audio=audio_file,
-                            title=meta.get('title') if meta else query,
-                            caption=caption,
-                            thumb=thumb_file
-                        )
-                else:
-                    await context.bot.send_audio(
-                        chat_id=chat_id,
-                        audio=audio_file,
-                        title=meta.get('title') if meta else query,
-                        caption=caption,
-                    )
+                await context.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=audio_file,
+                    title=meta.get('title') if meta else query,
+                    caption=caption,
+                )
         else:
             await context.bot.send_message(chat_id=chat_id, text="❌ No se generó archivo de audio.")
     except Exception as e:
@@ -170,8 +146,6 @@ async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_
             await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo descargar: {query} ({e})")
     finally:
         await manejar_eliminacion_segura(output_path)
-        if thumb_path and os.path.exists(thumb_path):
-            await manejar_eliminacion_segura(thumb_path)
 
 def detectar_plataforma(url: str):
     if "spotify.com" in url and "/track/" in url:
