@@ -10,6 +10,61 @@ from spotipy.oauth2 import SpotifyClientCredentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
+# --- Instaloader (solo público, sin login) ---
+from instaloader import Instaloader, Post
+
+IG_LOADER = Instaloader(
+    download_pictures=True,
+    download_videos=True,
+    download_video_thumbnails=False,
+    save_metadata=False,
+    download_comments=False,
+    post_metadata_txt_pattern=''
+)
+
+def _ig_shortcode_from_url(url: str):
+    m = re.search(r"instagram\.com/(?:p|reel|tv)/([^/?#&]+)", url)
+    return m.group(1) if m else None
+
+def descargar_instagram_public(url: str, base_dir: str) -> tuple[str, str] | tuple[None, None]:
+    """
+    Descarga el contenido público de Instagram (foto/video) a una carpeta temporal
+    y devuelve (filepath, 'video'|'photo'). No requiere login.
+    """
+    shortcode = _ig_shortcode_from_url(url)
+    if not shortcode:
+        return None, None
+    # Carpeta temporal única para esta descarga
+    target_dir = os.path.join(base_dir, f"ig_{uuid.uuid4().hex[:8]}")
+    os.makedirs(target_dir, exist_ok=True)
+
+    post = Post.from_shortcode(IG_LOADER.context, shortcode)
+    IG_LOADER.download_post(post, target=target_dir)
+
+    # Buscar primero video, si no hay, imagen
+    for root, _, files in os.walk(target_dir):
+        for fn in files:
+            if fn.lower().endswith(".mp4"):
+                return os.path.join(root, fn), "video"
+    for root, _, files in os.walk(target_dir):
+        for fn in files:
+            if fn.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                return os.path.join(root, fn), "photo"
+    return None, None
+
+def eliminar_directorio(path: str):
+    if not os.path.exists(path): return
+    for root, dirs, files in os.walk(path, topdown=False):
+        for f in files:
+            try: os.remove(os.path.join(root, f))
+            except: pass
+        for d in dirs:
+            try: os.rmdir(os.path.join(root, d))
+            except: pass
+    try: os.rmdir(path)
+    except: pass
+# ----------------------------------------------
+
 BOT_TOKEN = "8194406693:AAEaxgwVWdQIRjZNUBcal3ttnqCtjfja3Ek"
 SPOTIPY_CLIENT_ID = "a767e61138d6431abd23fa1b68dabcf5"
 SPOTIPY_CLIENT_SECRET = "64841836406d43c6887124df8e064ceb"
@@ -308,27 +363,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
 
     elif plataforma == "instagram":
-        file_id = str(uuid.uuid4())[:8]
-        filename = os.path.join(DOWNLOADS_DIR, f"insta_{file_id}.mp4")
-        descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
-        cmd = [
-            "yt-dlp", "-f", "mp4",
-            "-o", filename,
-            url
-        ]
+        descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando Instagram...")
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            with open(filename, 'rb') as f:
-                await context.bot.send_video(chat_id=chat_id, video=f)
-        except subprocess.CalledProcessError as e:
-            err_msg = (f"❌ Instagram error al descargar:\n"
-                       f"STDERR:\n{e.stderr[:1500]}\n"
-                       f"STDOUT:\n{e.stdout[:500]}")
-            await update.message.reply_text(err_msg)
+            media_path, media_type = descargar_instagram_public(url, DOWNLOADS_DIR)
+            if not media_path:
+                await update.message.reply_text("❌ No pude obtener el media público (¿es privado?).")
+            else:
+                if media_type == "video":
+                    with open(media_path, "rb") as f:
+                        await context.bot.send_video(chat_id=chat_id, video=f)
+                else:
+                    with open(media_path, "rb") as f:
+                        await context.bot.send_photo(chat_id=chat_id, photo=f)
+                # limpiar la carpeta que creó Instaloader
+                eliminar_directorio(os.path.dirname(media_path))
         except Exception as e:
-            await update.message.reply_text(f"❌ Instagram error inesperado: {e}")
+            await update.message.reply_text(f"❌ Instagram error: {e}")
         finally:
-            await manejar_eliminacion_segura(filename)
             try: await procesando_msg.delete()
             except: pass
             try: await descargando_msg.delete()
