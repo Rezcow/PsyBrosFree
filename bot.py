@@ -14,7 +14,13 @@ try:
 except Exception:
     instaloader = None
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+)
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 # === ENV / Constantes ===
@@ -126,7 +132,6 @@ async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_
             with open(output_path, 'rb') as audio_file:
                 await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
         else:
-            # muestra parte de stderr si falló
             err = (proc.stderr or "").strip()
             await context.bot.send_message(chat_id=chat_id, text=f"❌ No se generó archivo de audio.\n{err[:400]}")
     except Exception as e:
@@ -202,18 +207,18 @@ def obtener_tracks_album_spotify(album_url):
         print(f"[Spotify Album] Error: {e}")
     return tracks, cover_url, album_name
 
-# === Fallback con Instaloader para Instagram ===
-async def descargar_instagram_con_instaloader(url: str, outdir: str) -> str | None:
+# === Fallback con Instaloader para Instagram (fotos/carrusel/video) ===
+async def descargar_instagram_con_instaloader(url: str, outdir: str):
     """
-    Descarga el video de Instagram usando Instaloader.
-    Devuelve la ruta del .mp4 si todo va bien, si no devuelve None.
+    Descarga el/los medios de un post de Instagram usando Instaloader.
+    Devuelve una lista de dicts: [{"path": str, "type": "photo"|"video"}] o [] si falla.
     """
     if instaloader is None:
-        return None
+        return []
 
     m = re.search(r"instagram\.com/(?:reel|p|tv)/([A-Za-z0-9_-]+)", url)
     if not m:
-        return None
+        return []
     shortcode = m.group(1)
 
     target_dir = os.path.join(outdir, f"ig_{shortcode}")
@@ -246,19 +251,21 @@ async def descargar_instagram_con_instaloader(url: str, outdir: str) -> str | No
             os.rmdir(target_dir)
         except Exception:
             pass
-        return None
+        return []
 
-    # Buscar mp4 generado
-    video_path = None
+    # Recolectar todos los medios (fotos/videos) descargados
+    media = []
     try:
-        for f in os.listdir(target_dir):
-            if f.endswith(".mp4"):
-                video_path = os.path.join(target_dir, f)
-                break
-    except Exception:
-        pass
+        for f in sorted(os.listdir(target_dir)):
+            full = os.path.join(target_dir, f)
+            if f.lower().endswith(".mp4") and os.path.getsize(full) > 0:
+                media.append({"path": full, "type": "video"})
+            elif f.lower().endswith((".jpg", ".jpeg", ".png")) and os.path.getsize(full) > 0:
+                media.append({"path": full, "type": "photo"})
+    except Exception as e:
+        print(f"[Instaloader] List media error: {e}")
 
-    return video_path
+    return media
 
 # === Handlers ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -411,38 +418,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 err = (err or "") + ("\n" + (err2 or ""))
 
-        # Fallback 3: Instaloader
+        # Fallback 3: Instaloader (fotos/carrusel/video)
         used_instaloader = False
+        ig_media = []
         if not ok:
-            video_path = await descargar_instagram_con_instaloader(url, DOWNLOADS_DIR)
-            if video_path and os.path.exists(video_path):
+            ig_media = await descargar_instagram_con_instaloader(url, DOWNLOADS_DIR)
+            if ig_media:
                 used_instaloader = True
-                try:
-                    with open(video_path, 'rb') as f:
-                        await context.bot.send_video(chat_id=chat_id, video=f)
-                    ok = True
-                except Exception as e:
-                    err = f"[Instaloader send] {e}"
-                finally:
-                    try:
-                        base_dir = os.path.dirname(video_path)
-                        for f in os.listdir(base_dir):
-                            await manejar_eliminacion_segura(os.path.join(base_dir, f))
-                        os.rmdir(base_dir)
-                    except Exception:
-                        pass
+                ok = True  # ya tenemos algo para enviar
 
         try:
             if ok and not used_instaloader and os.path.exists(filename):
+                # Caso yt-dlp / ddinstagram con video
                 with open(filename, 'rb') as f:
                     await context.bot.send_video(chat_id=chat_id, video=f)
-            elif not ok:
+
+            elif ok and used_instaloader and ig_media:
+                # Enviar 1 o varios medios
+                if len(ig_media) == 1:
+                    item = ig_media[0]
+                    if item["type"] == "video":
+                        with open(item["path"], "rb") as f:
+                            await context.bot.send_video(chat_id=chat_id, video=f)
+                    else:
+                        with open(item["path"], "rb") as f:
+                            await context.bot.send_photo(chat_id=chat_id, photo=f)
+                else:
+                    # Enviar como álbum (media group), máx 10 elementos por mensaje
+                    batch = []
+                    for m in ig_media[:10]:
+                        if m["type"] == "video":
+                            batch.append(InputMediaVideo(open(m["path"], "rb")))
+                        else:
+                            batch.append(InputMediaPhoto(open(m["path"], "rb")))
+                    await context.bot.send_media_group(chat_id=chat_id, media=batch)
+
+            else:
                 hint = ""
                 if err and any(k in err.lower() for k in ["login", "private", "login required", "forbidden", "not available"]):
                     hint = "\n⚠️ Tip: agrega/actualiza INSTAGRAM_SESSIONID en variables de entorno."
                 await update.message.reply_text(f"❌ Instagram error.\n{(err or 'Sin detalle')[:700]}{hint}")
+
         finally:
+            # Limpieza de archivos temporales
             await manejar_eliminacion_segura(filename)
+            # limpiar carpeta generada por instaloader si existió
+            try:
+                if ig_media:
+                    base_dir = os.path.dirname(ig_media[0]["path"])
+                    for f in os.listdir(base_dir):
+                        await manejar_eliminacion_segura(os.path.join(base_dir, f))
+                    os.rmdir(base_dir)
+            except Exception:
+                pass
             try: await procesando_msg.delete()
             except: pass
             try: await descargando_msg.delete()
