@@ -1,8 +1,6 @@
-python-telegram-bot==20.7
-yt-dlp>=2025.07.21
-spotipy
-httpx
-beautifulsoup4
-mutagen
-scdl
-instaloader
+python-telegram-bot==21.6
+yt-dlp>=2024.12.01
+spotipy==2.23.0
+httpx==0.28.1
+beautifulsoup4==4.12.3
+scdl==2.7.3

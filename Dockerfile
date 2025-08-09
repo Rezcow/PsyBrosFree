@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     TZ=America/Santiago
 
-# Paquetes del sistema (ffmpeg es clave para MP3)
+# Paquetes del sistema (ffmpeg es clave para MP3) + limpieza
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg ca-certificates git tzdata \
  && rm -rf /var/lib/apt/lists/*
@@ -28,7 +28,7 @@ RUN python -m pip install --upgrade pip \
 # Copia el resto del proyecto
 COPY . /app
 
-# Crea carpeta de descargas con permisos
+# Carpeta de descargas y permisos
 RUN mkdir -p /app/downloads \
  && chown -R appuser:appuser /app
 

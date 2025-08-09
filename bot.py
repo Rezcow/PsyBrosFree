@@ -195,6 +195,7 @@ async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_
             "--audio-quality", "0",
             "--no-playlist",
             "--restrict-filenames",
+            "--force-ipv4",
             "-o", template
         ], capture_output=True, text=True)
 
@@ -223,8 +224,8 @@ async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_
 
 async def descargar_audio_desde_url(url: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
     """
-    Extrae audio MP3 directamente desde una URL de YouTube (sin buscar).
-    Requiere ffmpeg instalado en el sistema.
+    Extrae audio directo desde la URL (sin buscar).
+    Intenta MP3; si falla la conversión, muestra logs y envía M4A/WebM como fallback.
     """
     template = os.path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s")
     try:
@@ -236,43 +237,90 @@ async def descargar_audio_desde_url(url: str, chat_id, context: ContextTypes.DEF
             "--audio-quality", "0",
             "--no-playlist",
             "--restrict-filenames",
-            "-o", template
+            "--force-ipv4",
+            "-o", template,
+            "-v"
         ], capture_output=True, text=True)
 
         if proc.returncode != 0:
-            print(proc.stdout)
+            # Fallback: descargar bestaudio sin convertir
+            print("=== yt-dlp STDERR (mp3) ===")
             print(proc.stderr)
-            await context.bot.send_message(chat_id=chat_id, text="❌ Error al convertir a MP3 (revisa ffmpeg/yt-dlp).")
-            return
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ MP3 falló, intento fallback con audio original…")
 
-        mp3s = sorted(glob.glob(os.path.join(DOWNLOADS_DIR, "*.mp3")), key=os.path.getmtime, reverse=True)
-        if not mp3s:
-            print(proc.stdout)
-            print(proc.stderr)
-            await context.bot.send_message(chat_id=chat_id, text="❌ No se generó archivo MP3. (¿ffmpeg instalado?)")
-            return
+            proc2 = subprocess.run([
+                "yt-dlp",
+                url,
+                "-f", "bestaudio/best",
+                "--no-playlist",
+                "--restrict-filenames",
+                "--force-ipv4",
+                "-o", template,
+                "-v"
+            ], capture_output=True, text=True)
 
-        final_file = mp3s[0]
-        with open(final_file, "rb") as f:
-            await context.bot.send_audio(chat_id=chat_id, audio=f)
+            if proc2.returncode != 0:
+                print("=== yt-dlp STDERR (fallback) ===")
+                print(proc2.stderr)
+                await context.bot.send_message(chat_id=chat_id, text="❌ Error al descargar audio (fallback). Revisa logs del contenedor.")
+                return
 
-        await manejar_eliminacion_segura(final_file)
+        # Busca MP3 primero; si no, M4A/WebM
+        for pat in ["*.mp3", "*.m4a", "*.webm"]:
+            matches = sorted(glob.glob(os.path.join(DOWNLOADS_DIR, pat)), key=os.path.getmtime, reverse=True)
+            if matches:
+                final_file = matches[0]
+                try:
+                    with open(final_file, "rb") as f:
+                        await context.bot.send_audio(chat_id=chat_id, audio=f)
+                finally:
+                    await manejar_eliminacion_segura(final_file)
+                return
+
+        await context.bot.send_message(chat_id=chat_id, text="❌ No se generó ningún archivo de audio.")
 
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ Error descargando audio: {e}")
 
 
 async def descargar_video_youtube(url: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
-    filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
+    # Plantilla con extensión dinámica
+    template = os.path.join(DOWNLOADS_DIR, "youtube.%(ext)s")
     descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
     try:
-        subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
-        with open(filename, 'rb') as f:
-            await context.bot.send_video(chat_id=chat_id, video=f)
+        proc = subprocess.run([
+            "yt-dlp",
+            "-f", "bv*+ba/b",            # mejor video+audio; si no, best
+            "--merge-output-format", "mp4",
+            "--no-playlist",
+            "--restrict-filenames",
+            "--force-ipv4",
+            "-o", template,
+            url
+        ], capture_output=True, text=True)
+
+        if proc.returncode != 0:
+            print(proc.stdout)
+            print(proc.stderr)
+            await context.bot.send_message(chat_id=chat_id, text="❌ YouTube error (formato/merge). Revisa logs del contenedor.")
+            return
+
+        # Busca cualquier archivo youtube.* recién generado (mp4 ideal)
+        for ext in ["mp4", "mkv", "webm"]:
+            final_file = os.path.join(DOWNLOADS_DIR, f"youtube.{ext}")
+            if os.path.exists(final_file):
+                try:
+                    with open(final_file, 'rb') as f:
+                        await context.bot.send_video(chat_id=chat_id, video=f)
+                finally:
+                    await manejar_eliminacion_segura(final_file)
+                break
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="❌ No se encontró el archivo de video descargado.")
+
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ YouTube error: {e}")
     finally:
-        await manejar_eliminacion_segura(filename)
         try: await descargando_msg.delete()
         except: pass
 
@@ -405,16 +453,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Twitter / X (video)
     if plataforma == "twitter":
-        filename = os.path.join(DOWNLOADS_DIR, "x.mp4")
+        template = os.path.join(DOWNLOADS_DIR, "x.%(ext)s")
         descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
         try:
-            subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
-            with open(filename, 'rb') as f:
-                await context.bot.send_video(chat_id=chat_id, video=f)
+            proc = subprocess.run([
+                "yt-dlp",
+                "-f", "bv*+ba/b",
+                "--merge-output-format", "mp4",
+                "--no-playlist",
+                "--restrict-filenames",
+                "--force-ipv4",
+                "-o", template,
+                url
+            ], capture_output=True, text=True)
+
+            if proc.returncode != 0:
+                print(proc.stdout)
+                print(proc.stderr)
+                await update.message.reply_text("❌ Twitter/X error (formato/merge). Revisa logs del contenedor.")
+                return
+
+            for ext in ["mp4", "mkv", "webm"]:
+                final_file = os.path.join(DOWNLOADS_DIR, f"x.{ext}")
+                if os.path.exists(final_file):
+                    try:
+                        with open(final_file, 'rb') as f:
+                            await context.bot.send_video(chat_id=chat_id, video=f)
+                    finally:
+                        await manejar_eliminacion_segura(final_file)
+                    break
+            else:
+                await update.message.reply_text("❌ No se encontró el archivo de video descargado.")
         except Exception as e:
             await update.message.reply_text(f"❌ Twitter/X error: {e}")
         finally:
-            await manejar_eliminacion_segura(filename)
             try: await procesando_msg.delete()
             except: pass
             try: await descargando_msg.delete()
@@ -441,18 +513,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if tipo == "ytvideo":
-            filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
-            descargando_msg = await context.bot.send_message(chat_id=int(chat_id), text="Descargando video...")
-            try:
-                subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
-                with open(filename, 'rb') as f:
-                    await context.bot.send_video(chat_id=int(chat_id), video=f)
-            except Exception as e:
-                await context.bot.send_message(chat_id=int(chat_id), text=f"❌ YouTube error: {e}")
-            finally:
-                await manejar_eliminacion_segura(filename)
-                try: await descargando_msg.delete()
-                except: pass
+            await descargar_video_youtube(url, int(chat_id), context)
 
         elif tipo == "ytaudio":
             descargando_msg = await context.bot.send_message(chat_id=int(chat_id), text="Descargando audio...")
@@ -465,9 +526,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# Main
+# Main + chequeo dependencias
 # =========================
+def _check_dependencies():
+    def _run(cmd):
+        try:
+            out = subprocess.check_output(cmd, text=True).strip().splitlines()[0]
+            print(f"$ {' '.join(cmd)} -> {out}")
+        except Exception as e:
+            print(f"[WARN] No pude ejecutar {' '.join(cmd)}: {e}")
+
+    _run(["yt-dlp", "--version"])
+    _run(["ffmpeg", "-version"])
+
+
 if __name__ == "__main__":
+    _check_dependencies()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
