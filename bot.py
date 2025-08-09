@@ -1,8 +1,9 @@
 import os
 import re
+import glob
 import subprocess
-import httpx
 import uuid
+import httpx
 from bs4 import BeautifulSoup
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
@@ -10,17 +11,25 @@ from spotipy.oauth2 import SpotifyClientCredentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
+# =========================
+# Configuración y globals
+# =========================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SPOTIPY_CLIENT_ID = os.environ["SPOTIPY_CLIENT_ID"]
 SPOTIPY_CLIENT_SECRET = os.environ["SPOTIPY_CLIENT_SECRET"]
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# Diccionario para asociar el UUID al link real de YouTube
+# Diccionario para asociar UUID -> URL real de YouTube
 pending_youtube_links = {}
 
+
+# =========================
+# Utilidades
+# =========================
 def limpiar_url_params(url: str) -> str:
     return url.split("?")[0]
+
 
 async def manejar_eliminacion_segura(path):
     try:
@@ -28,6 +37,7 @@ async def manejar_eliminacion_segura(path):
             os.remove(path)
     except Exception as e:
         print(f"Error al eliminar {path}: {e}")
+
 
 async def obtener_teclado_odesli(original_url: str):
     api_url = f"https://api.song.link/v1-alpha.1/links?url={original_url}"
@@ -39,7 +49,7 @@ async def obtener_teclado_odesli(original_url: str):
             data = response.json()
             links = data.get("linksByPlatform", {})
             botones, fila = [], []
-            for _, (nombre, info) in enumerate(links.items()):
+            for i, (nombre, info) in enumerate(links.items()):
                 url = info.get("url")
                 if url:
                     fila.append(InlineKeyboardButton(text=nombre.capitalize(), url=url))
@@ -52,6 +62,7 @@ async def obtener_teclado_odesli(original_url: str):
     except Exception as e:
         print(f"Odesli error: {e}")
         return None
+
 
 async def obtener_metadatos_general(url: str):
     # 1) Intento por OpenGraph
@@ -93,7 +104,8 @@ async def obtener_metadatos_general(url: str):
         print(f"Odesli error: {e}")
     return None
 
-def obtener_metadatos_spotify_track(track_url):
+
+def obtener_metadatos_spotify_track(track_url: str):
     sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
         client_id=SPOTIPY_CLIENT_ID,
         client_secret=SPOTIPY_CLIENT_SECRET
@@ -111,46 +123,6 @@ def obtener_metadatos_spotify_track(track_url):
         print(f"[Spotify Track] Error: {e}")
         return None
 
-async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
-    sanitized = re.sub(r'[\\/*?:"<>|]', "", query)
-    output_path = os.path.join(DOWNLOADS_DIR, f"{sanitized}.mp3")
-    try:
-        proc = subprocess.run([
-            "yt-dlp",
-            f"ytsearch1:{query}",
-            "--extract-audio",
-            "--audio-format", "mp3",
-            "--audio-quality", "9",
-            "-o", output_path
-        ], capture_output=True, text=True)
-
-        if os.path.exists(output_path):
-            with open(output_path, 'rb') as audio_file:
-                await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
-        else:
-            # Log para diagnóstico
-            print(proc.stdout)
-            print(proc.stderr)
-            await context.bot.send_message(chat_id=chat_id, text="❌ No se generó archivo de audio.")
-    except Exception as e:
-        if "Timed out" not in str(e):
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo descargar: {query} ({e})")
-    finally:
-        await manejar_eliminacion_segura(output_path)
-
-async def descargar_video_youtube(url: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
-    filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
-    descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
-    try:
-        subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
-        with open(filename, 'rb') as f:
-            await context.bot.send_video(chat_id=chat_id, video=f)
-    except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ YouTube error: {e}")
-    finally:
-        await manejar_eliminacion_segura(filename)
-        try: await descargando_msg.delete()
-        except: pass
 
 def detectar_plataforma(url: str):
     if "spotify.com" in url and "/track/" in url:
@@ -169,7 +141,8 @@ def detectar_plataforma(url: str):
         return "twitter"
     return "desconocido"
 
-def obtener_tracks_album_spotify(album_url):
+
+def obtener_tracks_album_spotify(album_url: str):
     sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
         client_id=SPOTIPY_CLIENT_ID,
         client_secret=SPOTIPY_CLIENT_SECRET
@@ -203,6 +176,110 @@ def obtener_tracks_album_spotify(album_url):
         print(f"[Spotify Album] Error: {e}")
     return tracks, cover_url, album_name
 
+
+# =========================
+# Descargas con yt-dlp
+# =========================
+async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Búsqueda en YouTube por título+artista y extracción directa a MP3.
+    Requiere ffmpeg instalado en el sistema.
+    """
+    template = os.path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s")
+    try:
+        proc = subprocess.run([
+            "yt-dlp",
+            f"ytsearch1:{query}",
+            "-x",
+            "--audio-format", "mp3",
+            "--audio-quality", "0",
+            "--no-playlist",
+            "--restrict-filenames",
+            "-o", template
+        ], capture_output=True, text=True)
+
+        if proc.returncode != 0:
+            print(proc.stdout)
+            print(proc.stderr)
+            await context.bot.send_message(chat_id=chat_id, text="❌ Error al convertir a MP3 (revisa ffmpeg/yt-dlp).")
+            return
+
+        mp3s = sorted(glob.glob(os.path.join(DOWNLOADS_DIR, "*.mp3")), key=os.path.getmtime, reverse=True)
+        if not mp3s:
+            print(proc.stdout)
+            print(proc.stderr)
+            await context.bot.send_message(chat_id=chat_id, text="❌ No se generó archivo de audio.")
+            return
+
+        final_file = mp3s[0]
+        with open(final_file, 'rb') as audio_file:
+            await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
+        await manejar_eliminacion_segura(final_file)
+
+    except Exception as e:
+        if "Timed out" not in str(e):
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo descargar: {query} ({e})")
+
+
+async def descargar_audio_desde_url(url: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Extrae audio MP3 directamente desde una URL de YouTube (sin buscar).
+    Requiere ffmpeg instalado en el sistema.
+    """
+    template = os.path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s")
+    try:
+        proc = subprocess.run([
+            "yt-dlp",
+            url,
+            "-x",
+            "--audio-format", "mp3",
+            "--audio-quality", "0",
+            "--no-playlist",
+            "--restrict-filenames",
+            "-o", template
+        ], capture_output=True, text=True)
+
+        if proc.returncode != 0:
+            print(proc.stdout)
+            print(proc.stderr)
+            await context.bot.send_message(chat_id=chat_id, text="❌ Error al convertir a MP3 (revisa ffmpeg/yt-dlp).")
+            return
+
+        mp3s = sorted(glob.glob(os.path.join(DOWNLOADS_DIR, "*.mp3")), key=os.path.getmtime, reverse=True)
+        if not mp3s:
+            print(proc.stdout)
+            print(proc.stderr)
+            await context.bot.send_message(chat_id=chat_id, text="❌ No se generó archivo MP3. (¿ffmpeg instalado?)")
+            return
+
+        final_file = mp3s[0]
+        with open(final_file, "rb") as f:
+            await context.bot.send_audio(chat_id=chat_id, audio=f)
+
+        await manejar_eliminacion_segura(final_file)
+
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Error descargando audio: {e}")
+
+
+async def descargar_video_youtube(url: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
+    filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
+    descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
+    try:
+        subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
+        with open(filename, 'rb') as f:
+            await context.bot.send_video(chat_id=chat_id, video=f)
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ YouTube error: {e}")
+    finally:
+        await manejar_eliminacion_segura(filename)
+        try: await descargando_msg.delete()
+        except: pass
+
+
+# =========================
+# Handlers
+# =========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
@@ -220,23 +297,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if teclado:
         await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
 
-    # YOUTUBE: pregunta si audio o video usando UUID
+    # YouTube: ofrecer Audio/Video
     if plataforma == "youtube":
         link_id = str(uuid.uuid4())
         pending_youtube_links[link_id] = url
-        botones = [
-            [
-                InlineKeyboardButton("🎬 Video", callback_data=f"ytvideo|{link_id}|{chat_id}"),
-                InlineKeyboardButton("🎵 Audio", callback_data=f"ytaudio|{link_id}|{chat_id}")
-            ]
-        ]
+        botones = [[
+            InlineKeyboardButton("🎬 Video", callback_data=f"ytvideo|{link_id}|{chat_id}"),
+            InlineKeyboardButton("🎵 Audio", callback_data=f"ytaudio|{link_id}|{chat_id}")
+        ]]
         reply_markup = InlineKeyboardMarkup(botones)
         await update.message.reply_text("¿Qué formato deseas recibir?", reply_markup=reply_markup)
         try: await procesando_msg.delete()
         except: pass
         return
 
-    # TRACKS
+    # Tracks
     if plataforma == "spotify_track":
         query_txt = obtener_metadatos_spotify_track(url)
         if not query_txt:
@@ -267,7 +342,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
         return
 
-    # ÁLBUMES SPOTIFY (envía carátula primero)
+    # Álbumes de Spotify (carátula primero)
     if plataforma == "spotify_album":
         album_msg = await context.bot.send_message(chat_id=chat_id, text="⏳ Descargando álbum, esto puede tardar varios minutos...")
         tracks, cover_url, album_name = obtener_tracks_album_spotify(url)
@@ -279,7 +354,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             return
 
-        # Descargar y enviar carátula primero
+        # Enviar carátula primero (si existe)
         if cover_url:
             try:
                 cover_path = os.path.join(DOWNLOADS_DIR, "cover.jpg")
@@ -311,7 +386,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
         return
 
-    # SOUNDCLOUD
+    # SoundCloud
     if plataforma == "soundcloud":
         try:
             subprocess.run(["scdl", "-l", limpiar_url_params(url), "-o", DOWNLOADS_DIR, "-f", "--onlymp3"], check=True)
@@ -328,7 +403,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
         return
 
-    # TWITTER / X
+    # Twitter / X (video)
     if plataforma == "twitter":
         filename = os.path.join(DOWNLOADS_DIR, "x.mp4")
         descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
@@ -351,11 +426,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await procesando_msg.delete()
     except: pass
 
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
+    # Solo recibe link_id y chat_id
     if data.startswith("ytvideo|") or data.startswith("ytaudio|"):
         tipo, link_id, chat_id = data.split("|", 2)
         url = pending_youtube_links.get(link_id)
@@ -378,18 +455,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
 
         elif tipo == "ytaudio":
-            query_txt = await obtener_metadatos_general(url)
-            if not query_txt:
-                await context.bot.send_message(chat_id=int(chat_id), text="❌ No se pudo extraer título/artista.")
-                return
-            descargando_msg = await context.bot.send_message(chat_id=int(chat_id), text=f"Descargando: {query_txt}")
-            await buscar_y_descargar(query_txt, int(chat_id), context)
+            descargando_msg = await context.bot.send_message(chat_id=int(chat_id), text="Descargando audio...")
+            await descargar_audio_desde_url(url, int(chat_id), context)
             try: await descargando_msg.delete()
             except: pass
 
         # Limpia el link de memoria
         pending_youtube_links.pop(link_id, None)
 
+
+# =========================
+# Main
+# =========================
 if __name__ == "__main__":
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
