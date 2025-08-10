@@ -1,39 +1,21 @@
-# Imagen base
-FROM python:3.12-slim
+FROM python:3.11-slim
 
-# Evita bytecode y buffer, fija TZ
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    TZ=America/Santiago
+# Dependencias del sistema
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-# Paquetes del sistema (ffmpeg es clave para MP3) + limpieza
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg ca-certificates git tzdata \
- && rm -rf /var/lib/apt/lists/*
-
-# Crea usuario no-root
-RUN useradd -ms /bin/bash appuser
-
-# Directorio de trabajo
 WORKDIR /app
 
-# Copia requirements primero para aprovechar cache
-COPY requirements.txt /app/requirements.txt
+# Reqs primero para aprovechar cache
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Actualiza pip e instala dependencias
-RUN python -m pip install --upgrade pip \
- && python -m pip install -r requirements.txt
+# Código
+COPY bot.py .
 
-# Copia el resto del proyecto
-COPY . /app
+ENV PYTHONUNBUFFERED=1
+# Opcional: logs de yt-dlp un poco más silenciosos
+ENV YTDLP_NO_UPDATE=1
 
-# Carpeta de descargas y permisos
-RUN mkdir -p /app/downloads \
- && chown -R appuser:appuser /app
-
-# Cambia a usuario no-root
-USER appuser
-
-# Comando para iniciar el bot
 CMD ["python", "bot.py"]
