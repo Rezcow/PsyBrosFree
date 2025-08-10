@@ -1,6 +1,7 @@
 import os
 import re
 import uuid
+import asyncio
 import subprocess
 
 import httpx
@@ -97,29 +98,48 @@ async def obtener_metadatos_general(url: str):
     return None
 
 async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
-    sanitized = re.sub(r'[\\/*?:"<>|]', "", query)
-    output_path = os.path.join(DOWNLOADS_DIR, f"{sanitized}.mp3")
-    try:
-        proc = subprocess.run([
+    """
+    Descarga audio usando yt-dlp con plantilla de salida y leyendo la ruta final.
+    Si MP3 falla, intenta M4A como fallback.
+    """
+    template = os.path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s")
+
+    def _run(format_ext: str) -> str | None:
+        cmd = [
             "yt-dlp",
             f"ytsearch1:{query}",
             "--extract-audio",
-            "--audio-format", "mp3",
-            "--audio-quality", "9",
-            "-o", output_path
-        ], capture_output=True, text=True)
+            "--audio-format", format_ext,      # mp3 o m4a
+            "--audio-quality", "0",            # mejor calidad disponible
+            "--no-warnings",
+            "--no-playlist",
+            "--restrict-filenames",
+            "-o", template,
+            "--print", "after_move:filepath"   # imprime la ruta final creada
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            print("[yt-dlp error]", proc.stderr[:1000])
+            return None
+        out = (proc.stdout or "").strip().splitlines()
+        path = out[-1] if out else ""
+        return path if path and os.path.exists(path) else None
 
-        if os.path.exists(output_path):
-            with open(output_path, 'rb') as audio_file:
+    path = await asyncio.to_thread(_run, "mp3")
+    if not path:
+        path = await asyncio.to_thread(_run, "m4a")
+
+    if path and os.path.exists(path):
+        try:
+            with open(path, 'rb') as audio_file:
                 await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
-        else:
-            print(proc.stdout, proc.stderr)
-            await context.bot.send_message(chat_id=chat_id, text="❌ No se generó archivo de audio.")
-    except Exception as e:
-        if "Timed out" not in str(e):
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ No se pudo descargar: {query} ({e})")
-    finally:
-        await manejar_eliminacion_segura(output_path)
+        finally:
+            await manejar_eliminacion_segura(path)
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ Error al convertir a audio (revisa ffmpeg/yt-dlp). Intenta con otra búsqueda."
+        )
 
 async def descargar_video_youtube(url: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
     filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
