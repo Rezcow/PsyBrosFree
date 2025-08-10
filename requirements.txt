@@ -1,3 +1,4 @@
 python-telegram-bot==21.4
 yt-dlp>=2024.07.16
 httpx==0.28.1
+beautifulsoup4==4.13.3
