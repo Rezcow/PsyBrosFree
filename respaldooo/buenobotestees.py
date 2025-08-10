@@ -1,18 +1,27 @@
 import os
 import re
-import subprocess
-import httpx
 import uuid
+import asyncio
+import tempfile
+import mimetypes
+import subprocess
+from pathlib import Path
+
+import httpx
 from bs4 import BeautifulSoup
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
+from instaloader import Instaloader, Post  # ⬅️ NUEVO
+
+from PIL import Image  # ⬅️ para WEBP→JPG
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-SPOTIPY_CLIENT_ID = os.environ["SPOTIPY_CLIENT_ID"]
-SPOTIPY_CLIENT_SECRET = os.environ["SPOTIPY_CLIENT_SECRET"]
+SPOTIPY_CLIENT_ID = os.environ.get("SPOTIPY_CLIENT_ID")
+SPOTIPY_CLIENT_SECRET = os.environ.get("SPOTIPY_CLIENT_SECRET")
+
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
@@ -24,7 +33,11 @@ def limpiar_url_params(url: str) -> str:
 
 async def manejar_eliminacion_segura(path):
     try:
-        if os.path.exists(path):
+        if isinstance(path, (list, tuple, set)):
+            for p in path:
+                if p and os.path.exists(p): os.remove(p)
+            return
+        if path and os.path.exists(path):
             os.remove(path)
     except Exception as e:
         print(f"Error al eliminar {path}: {e}")
@@ -44,11 +57,10 @@ async def obtener_teclado_odesli(original_url: str):
                 if url:
                     fila.append(InlineKeyboardButton(text=nombre.capitalize(), url=url))
                     if len(fila) == 3:
-                        botones.append(fila)
-                        fila = []
+                        botones.append(fila); fila = []
             if fila:
                 botones.append(fila)
-            return InlineKeyboardMarkup(botones)
+            return InlineKeyboardMarkup(botones) if botones else None
     except Exception as e:
         print(f"Odesli error: {e}")
         return None
@@ -108,6 +120,7 @@ async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_
             with open(output_path, 'rb') as audio_file:
                 await context.bot.send_audio(chat_id=chat_id, audio=audio_file, title=query)
         else:
+            print(proc.stdout, proc.stderr)
             await context.bot.send_message(chat_id=chat_id, text="❌ No se generó archivo de audio.")
     except Exception as e:
         if "Timed out" not in str(e):
@@ -149,6 +162,8 @@ def detectar_plataforma(url: str):
     return "desconocido"
 
 def obtener_tracks_album_spotify(album_url):
+    if not (SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET):
+        return [], None, None
     sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
         client_id=SPOTIPY_CLIENT_ID,
         client_secret=SPOTIPY_CLIENT_SECRET
@@ -182,7 +197,133 @@ def obtener_tracks_album_spotify(album_url):
         print(f"[Spotify Album] Error: {e}")
     return tracks, cover_url, album_name
 
+# =========================
+#  Instagram: híbrido sin login
+# =========================
+
+def _is_image(path: Path) -> bool:
+    mime, _ = mimetypes.guess_type(str(path))
+    return (mime and mime.startswith("image/")) or path.suffix.lower() in {".jpg",".jpeg",".png",".webp"}
+
+def _is_video(path: Path) -> bool:
+    mime, _ = mimetypes.guess_type(str(path))
+    return (mime and mime.startswith("video/")) or path.suffix.lower() in {".mp4",".mov",".webm",".mkv"}
+
+def _webp_to_jpg(p: Path) -> Path:
+    if p.suffix.lower() != ".webp":
+        return p
+    try:
+        img = Image.open(p).convert("RGB")
+        out = p.with_suffix(".jpg")
+        img.save(out, "JPEG", quality=95)
+        p.unlink(missing_ok=True)
+        return out
+    except Exception as e:
+        print(f"[WEBP->JPG] {e}")
+        return p
+
+def _ig_shortcode_from_url(url: str) -> str | None:
+    m = re.search(r"instagram\\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)/?", url)
+    return m.group(1) if m else None
+
+async def _try_ytdlp_instagram(url: str, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "yt-dlp",
+        "--no-warnings",
+        "--restrict-filenames",
+        "--recode-video", "mp4",               # normaliza a mp4
+        "--merge-output-format", "mp4",
+        "-o", str(out_dir / "%(id)s.%(ext)s"),
+        "--add-header", "User-Agent: Mozilla/5.0",
+        "-R", "2",
+        url
+    ]
+    proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr[:800] or "yt-dlp failed")
+    files = [p for p in out_dir.glob("*") if p.suffix not in {".part",".ytdl",".json"} and p.stat().st_size>0]
+    return files
+
+async def _try_instaloader_instagram(url: str, out_dir: Path):
+    """
+    Sin login. Usa Instaloader para obtener URLs directas por shortcode y descarga con httpx.
+    Cubre post simple, reel y carrusel (sidecar).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sc = _ig_shortcode_from_url(url)
+    if not sc:
+        return []
+
+    try:
+        L = Instaloader(
+            download_pictures=False,
+            download_videos=False,
+            download_video_thumbnails=False,
+            save_metadata=False,
+            compress_json=False,
+            post_metadata_txt_pattern=""
+        )
+        ctx = L.context
+        post = Post.from_shortcode(ctx, sc)
+
+        items = []
+        if post.typename == "GraphSidecar":
+            for node in post.get_sidecar_nodes():
+                if node.is_video:
+                    items.append(("video", node.video_url))
+                else:
+                    items.append(("image", node.display_url))
+        else:
+            if post.is_video:
+                items.append(("video", post.video_url))
+            else:
+                # post.url = imagen principal
+                items.append(("image", post.url))
+
+        files = []
+        async with httpx.AsyncClient() as client:
+            for typ, media_url in items:
+                try:
+                    r = await client.get(media_url, timeout=20)
+                    if r.status_code == 200 and r.content:
+                        ext = ".mp4" if typ == "video" else ".jpg"
+                        p = out_dir / f"ig_{uuid.uuid4().hex}{ext}"
+                        p.write_bytes(r.content)
+                        files.append(p)
+                except Exception as e:
+                    print(f"[Instaloader DL] {e}")
+        return files
+    except Exception as e:
+        print(f"[Instaloader] {e}")
+        return []
+
+async def _og_media_from_instagram(url: str):
+    """Fallback a metatags OG. Devuelve lista [{'type','url'}]."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    media = []
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, headers=headers, timeout=12)
+            if r.status_code != 200:
+                return media
+            soup = BeautifulSoup(r.text, "html.parser")
+            og_video = soup.find("meta", property="og:video")
+            og_image = soup.find("meta", property="og:image")
+            if og_video and og_video.get("content"):
+                media.append({"type": "video", "url": og_video["content"]})
+            if og_image and og_image.get("content"):
+                media.append({"type": "image", "url": og_image["content"]})
+    except Exception as e:
+        print(f"[IG OG] {e}")
+    return media
+
+# =========================
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
     text = update.message.text
     chat_id = update.effective_chat.id
 
@@ -199,26 +340,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if teclado:
         await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
 
-    # YOUTUBE: pregunta si audio o video usando UUID
+    # YOUTUBE
     if plataforma == "youtube":
         link_id = str(uuid.uuid4())
         pending_youtube_links[link_id] = url
-        botones = [
-            [
-                InlineKeyboardButton("🎬 Video", callback_data=f"ytvideo|{link_id}|{chat_id}"),
-                InlineKeyboardButton("🎵 Audio", callback_data=f"ytaudio|{link_id}|{chat_id}")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(botones)
-        await update.message.reply_text(
-            "¿Qué formato deseas recibir?",
-            reply_markup=reply_markup
-        )
+        botones = [[
+            InlineKeyboardButton("🎬 Video", callback_data=f"ytvideo|{link_id}|{chat_id}"),
+            InlineKeyboardButton("🎵 Audio", callback_data=f"ytaudio|{link_id}|{chat_id}")
+        ]]
+        await update.message.reply_text("¿Qué formato deseas recibir?", reply_markup=InlineKeyboardMarkup(botones))
         try: await procesando_msg.delete()
         except: pass
         return
 
-    # TRACKS: Spotify, Apple Music, YouTube Music (audio)
+    # TRACK
     if plataforma in ["spotify_track", "apple_song", "youtube_music"]:
         query = await obtener_metadatos_general(url)
         if not query:
@@ -235,7 +370,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
         return
 
-    # ALBUMES SPOTIFY (carátula primero)
+    # ÁLBUM SPOTIFY
     elif plataforma == "spotify_album":
         album_msg = await context.bot.send_message(chat_id=chat_id, text="⏳ Descargando álbum, esto puede tardar varios minutos...")
         tracks, cover_url, album_name = obtener_tracks_album_spotify(url)
@@ -247,7 +382,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             return
 
-        # Descargar y enviar carátula primero
+        # Carátula
         if cover_url:
             try:
                 cover_path = os.path.join(DOWNLOADS_DIR, "cover.jpg")
@@ -265,14 +400,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await album_msg.delete()
         except: pass
 
-        for idx, query in enumerate(tracks, 1):
+        for idx, q in enumerate(tracks, 1):
             try:
-                descargando_msg = await context.bot.send_message(chat_id=chat_id, text=f"🎵 [{idx}/{len(tracks)}] Descargando: {query}")
-                await buscar_y_descargar(query, chat_id, context)
+                descargando_msg = await context.bot.send_message(chat_id=chat_id, text=f"🎵 [{idx}/{len(tracks)}] Descargando: {q}")
+                await buscar_y_descargar(q, chat_id, context)
                 try: await descargando_msg.delete()
                 except: pass
             except Exception as e:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Error con la canción {query}: {e}")
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Error con la canción {q}: {e}")
 
         await context.bot.send_message(chat_id=chat_id, text="✅ Álbum completo enviado.")
         try: await procesando_msg.delete()
@@ -295,19 +430,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
 
     elif plataforma == "instagram":
-        filename = os.path.join(DOWNLOADS_DIR, "insta.mp4")
-        descargando_msg = await context.bot.send_message(chat_id=chat_id, text="Descargando video...")
+        tmp = Path(DOWNLOADS_DIR) / f"ig_{uuid.uuid4().hex}"
+        msg = await context.bot.send_message(chat_id=chat_id, text="Descargando de Instagram…")
         try:
-            subprocess.run(["yt-dlp", "-f", "mp4", "-o", filename, url], check=True)
-            with open(filename, 'rb') as f:
-                await context.bot.send_video(chat_id=chat_id, video=f)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Instagram error: {e}")
+            files = []
+            # 1) yt-dlp sin cookies
+            try:
+                files = await _try_ytdlp_instagram(url, tmp)
+            except Exception as e:
+                print(f"[IG yt-dlp] {e}")
+                files = []
+
+            # 2) Instaloader sin login
+            if not files:
+                try:
+                    files = await _try_instaloader_instagram(url, tmp)
+                except Exception as e:
+                    print(f"[IG instaloader] {e}")
+                    files = []
+
+            # 3) Fallback OG
+            if not files:
+                og = await _og_media_from_instagram(url)
+                for item in og:
+                    try:
+                        async with httpx.AsyncClient() as client:
+                            r = await client.get(item["url"], timeout=20)
+                            if r.status_code == 200 and r.content:
+                                ext = ".mp4" if item["type"] == "video" else ".jpg"
+                                p = tmp / f"ig_{uuid.uuid4().hex}{ext}"
+                                p.write_bytes(r.content)
+                    except Exception as e:
+                        print(f"[IG OG DL] {e}")
+                files = [p for p in tmp.glob("*") if p.stat().st_size>0]
+
+            if not files:
+                await update.message.reply_text("❌ No pude descargar ese enlace sin iniciar sesión.")
+            else:
+                for p in sorted(files):
+                    try:
+                        if _is_image(p):
+                            p = _webp_to_jpg(p)
+                            with p.open("rb") as fh:
+                                await context.bot.send_photo(chat_id=chat_id, photo=fh)
+                        elif _is_video(p):
+                            try:
+                                with p.open("rb") as fh:
+                                    await context.bot.send_video(chat_id=chat_id, video=fh)
+                            except Exception:
+                                with p.open("rb") as fh:
+                                    await context.bot.send_document(chat_id=chat_id, document=fh)
+                        else:
+                            with p.open("rb") as fh:
+                                await context.bot.send_document(chat_id=chat_id, document=fh)
+                    except Exception as e:
+                        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ No pude enviar {p.name}: {e}")
         finally:
-            await manejar_eliminacion_segura(filename)
+            try:
+                for p in tmp.glob("*"): p.unlink(missing_ok=True)
+                tmp.rmdir()
+            except: pass
             try: await procesando_msg.delete()
             except: pass
-            try: await descargando_msg.delete()
+            try: await msg.delete()
             except: pass
 
     elif plataforma == "twitter":
@@ -336,7 +521,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    # Solo recibe el link_id y el chat_id
     if data.startswith("ytvideo|") or data.startswith("ytaudio|"):
         tipo, link_id, chat_id = data.split("|", 2)
         url = pending_youtube_links.get(link_id)
@@ -368,7 +552,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: await descargando_msg.delete()
             except: pass
 
-        # Limpia el link de memoria
         pending_youtube_links.pop(link_id, None)
 
 if __name__ == "__main__":
