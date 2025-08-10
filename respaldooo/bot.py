@@ -1,5 +1,3 @@
-# bot.py — Adaptado con flujo Instagram estilo “Reels-Shorts” pero sin sesión (no instagrapi)
-
 import os
 import re
 import uuid
@@ -7,6 +5,7 @@ import asyncio
 import mimetypes
 import subprocess
 import urllib.parse
+import unicodedata
 from pathlib import Path
 
 import httpx
@@ -25,56 +24,64 @@ from telegram.ext import Application, MessageHandler, CallbackQueryHandler, Cont
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SPOTIPY_CLIENT_ID = os.environ.get("SPOTIPY_CLIENT_ID")
 SPOTIPY_CLIENT_SECRET = os.environ.get("SPOTIPY_CLIENT_SECRET")
+DEBUG = os.environ.get("DEBUG", "0") == "1"
 
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# Memoria temporal para elecciones de YouTube (audio/video)
 pending_youtube_links = {}
 
 # =========================
 # Utilidades generales
 # =========================
-ZERO_WIDTH = re.compile(r'[\u200B-\u200D\uFEFF]')
+# Invisibles frecuentes: ZW*, LRM/RLM, LRE/RLE/PDF, LRI/RLI/FSI/PDI, BOM
+ZERO_WIDTH = re.compile(r'[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]')
 TRAILING_GARBAGE = '),.?!…>]"\'’”»'
 
 def extraer_url_limpia(texto: str) -> str | None:
-    texto = ZERO_WIDTH.sub("", texto or "")
-    m = re.search(r'https?://\S+', texto, flags=re.IGNORECASE)
+    # normaliza y quita invisibles que Telegram a veces mete
+    texto = unicodedata.normalize("NFKC", texto or "")
+    texto = ZERO_WIDTH.sub("", texto)
+    m = re.search(r'https?://[^\s<>]+', texto, flags=re.IGNORECASE)
     if not m:
         return None
     url = m.group(0).strip().rstrip(TRAILING_GARBAGE)
     try:
         p = urllib.parse.urlsplit(url)
+        # reconstruye sin fragmento
         url = urllib.parse.urlunsplit((p.scheme, p.netloc, p.path, p.query, ''))
     except Exception:
         pass
     return url
 
-def limpiar_url_params(url: str) -> str:
+def host(url: str) -> str:
     try:
         p = urllib.parse.urlsplit(url)
-        return urllib.parse.urlunsplit((p.scheme, p.netloc, p.path, '', ''))
+        h = (p.hostname or p.netloc or "").lower()
+        if h.startswith("www."):
+            h = h[4:]
+        return h
     except Exception:
-        return url.split("?")[0]
+        return (url or "").lower()
 
 def detectar_plataforma(url: str) -> str:
-    u = url.lower()
-    if ("instagram.com/" in u) or ("instagr.am/" in u) or ("m.instagram.com/" in u):
+    h = host(url)
+    path = urllib.parse.urlsplit(url).path.lower()
+    if h.endswith("instagram.com") or h.endswith("instagr.am"):
         return "instagram"
-    if "spotify.com/track/" in u:
+    if "spotify.com" in h and "/track/" in path:
         return "spotify_track"
-    if "spotify.com/album/" in u:
+    if "spotify.com" in h and "/album/" in path:
         return "spotify_album"
-    if "music.apple.com" in u and ("/song/" in u or "?i=" in u):
+    if "music.apple.com" in h and ("/song/" in path or "?i=" in url.lower()):
         return "apple_song"
-    if "music.youtube.com" in u:
+    if "music.youtube.com" in h:
         return "youtube_music"
-    if "youtube.com" in u or "youtu.be" in u:
+    if h.endswith("youtube.com") or h.endswith("youtu.be"):
         return "youtube"
-    if "soundcloud.com" in u:
+    if "soundcloud.com" in h:
         return "soundcloud"
-    if "twitter.com" in u or "x.com" in u:
+    if h.endswith("twitter.com") or h.endswith("x.com"):
         return "twitter"
     return "desconocido"
 
@@ -119,7 +126,6 @@ async def obtener_teclado_odesli(original_url: str):
 # Metadata general (Spotify/Apple/YT Music)
 # =========================
 async def obtener_metadatos_general(url: str):
-    # 1) scrape OG
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         async with httpx.AsyncClient() as client:
@@ -138,7 +144,6 @@ async def obtener_metadatos_general(url: str):
     except Exception as e:
         print(f"[SCRAPE] Error: {e}")
 
-    # 2) Odesli fallback
     api_url = f"https://api.song.link/v1-alpha.1/links?url={url}"
     try:
         async with httpx.AsyncClient() as client:
@@ -243,7 +248,7 @@ def obtener_tracks_album_spotify(album_url):
     return tracks, cover_url, album_name
 
 # =========================
-# Instagram (sin login): estilo “Reels-Shorts” pero sin instagrapi
+# Instagram (sin login): yt-dlp → instaloader → OG
 # =========================
 def _is_image(path: Path) -> bool:
     mime, _ = mimetypes.guess_type(str(path))
@@ -267,7 +272,6 @@ def _webp_to_jpg(p: Path) -> Path:
         return p
 
 def _ig_shortcode_from_url(url: str) -> str | None:
-    # soporta /p/, /reel/, /tv/
     m = re.search(r"(?:instagram\.com|instagr\.am)/(?:p|reel|tv)/([A-Za-z0-9_-]+)/?", url)
     return m.group(1) if m else None
 
@@ -277,7 +281,7 @@ async def _try_ytdlp_instagram(url: str, out_dir: Path):
         "yt-dlp",
         "--no-warnings",
         "--restrict-filenames",
-        "--recode-video", "mp4",               # normaliza video a mp4
+        "--recode-video", "mp4",
         "--merge-output-format", "mp4",
         "-o", str(out_dir / "%(id)s.%(ext)s"),
         "--add-header", "User-Agent: Mozilla/5.0",
@@ -291,14 +295,10 @@ async def _try_ytdlp_instagram(url: str, out_dir: Path):
     return files
 
 async def _try_instaloader_instagram(url: str, out_dir: Path):
-    """
-    Sin login. Inspira la lógica del repo: detecta shortcode y pide URLs directas.
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
     sc = _ig_shortcode_from_url(url)
     if not sc:
         return []
-
     try:
         L = Instaloader(
             download_pictures=False,
@@ -309,19 +309,12 @@ async def _try_instaloader_instagram(url: str, out_dir: Path):
             post_metadata_txt_pattern=""
         )
         post = Post.from_shortcode(L.context, sc)
-
         items = []
         if post.typename == "GraphSidecar":
             for node in post.get_sidecar_nodes():
-                if node.is_video:
-                    items.append(("video", node.video_url))
-                else:
-                    items.append(("image", node.display_url))
+                items.append(("video" if node.is_video else "image", node.video_url if node.is_video else node.display_url))
         else:
-            if post.is_video:
-                items.append(("video", post.video_url))
-            else:
-                items.append(("image", post.url))
+            items.append(("video" if post.is_video else "image", post.video_url if post.is_video else post.url))
 
         files = []
         async with httpx.AsyncClient() as client:
@@ -360,27 +353,27 @@ async def _og_media_from_instagram(url: str):
     return media
 
 # =========================
-# Handler principal de mensajes
+# Handler principal
 # =========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-
     text = update.message.text
     chat_id = update.effective_chat.id
 
     url = extraer_url_limpia(text)
     if not url:
         return
-
     plataforma = detectar_plataforma(url)
+    if DEBUG:
+        await update.message.reply_text(f"[debug] host={host(url)}\nplataforma={plataforma}\n{url}")
+
     procesando_msg = await update.message.reply_text("🔎 Procesando...")
 
     teclado = await obtener_teclado_odesli(url)
     if teclado:
         await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
 
-    # YOUTUBE: pregunta por Audio/Video
     if plataforma == "youtube":
         link_id = str(uuid.uuid4())
         pending_youtube_links[link_id] = url
@@ -393,7 +386,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
         return
 
-    # TRACKS: Spotify, Apple Music, YouTube Music
     if plataforma in ["spotify_track", "apple_song", "youtube_music"]:
         query = await obtener_metadatos_general(url)
         if not query:
@@ -401,7 +393,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: await procesando_msg.delete()
             except: pass
             return
-
         descargando_msg = await context.bot.send_message(chat_id=chat_id, text=f"Descargando: {query}")
         await buscar_y_descargar(query, chat_id, context)
         try: await procesando_msg.delete()
@@ -410,7 +401,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
         return
 
-    # ÁLBUMES SPOTIFY
     elif plataforma == "spotify_album":
         album_msg = await context.bot.send_message(chat_id=chat_id, text="⏳ Descargando álbum, esto puede tardar varios minutos...")
         tracks, cover_url, album_name = obtener_tracks_album_spotify(url)
@@ -421,8 +411,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: await album_msg.delete()
             except: pass
             return
-
-        # Enviar carátula
         if cover_url:
             try:
                 cover_path = os.path.join(DOWNLOADS_DIR, "cover.jpg")
@@ -436,10 +424,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await manejar_eliminacion_segura(cover_path)
             except Exception as e:
                 print(f"[COVER] Error al enviar carátula: {e}")
-
         try: await album_msg.delete()
         except: pass
-
         for idx, q in enumerate(tracks, 1):
             try:
                 descargando_msg = await context.bot.send_message(chat_id=chat_id, text=f"🎵 [{idx}/{len(tracks)}] Descargando: {q}")
@@ -448,7 +434,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
             except Exception as e:
                 await context.bot.send_message(chat_id=chat_id, text=f"❌ Error con la canción {q}: {e}")
-
         await context.bot.send_message(chat_id=chat_id, text="✅ Álbum completo enviado.")
         try: await procesando_msg.delete()
         except: pass
@@ -456,7 +441,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif plataforma == "soundcloud":
         try:
-            subprocess.run(["scdl", "-l", limpiar_url_params(url), "-o", DOWNLOADS_DIR, "-f", "--onlymp3"], check=True)
+            subprocess.run(["scdl", "-l", url, "-o", DOWNLOADS_DIR, "-f", "--onlymp3"], check=True)
             for file in os.listdir(DOWNLOADS_DIR):
                 if file.endswith(".mp3"):
                     path = os.path.join(DOWNLOADS_DIR, file)
@@ -474,22 +459,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await context.bot.send_message(chat_id=chat_id, text="Descargando de Instagram…")
         try:
             files = []
-            # 1) yt-dlp sin cookies
             try:
                 files = await _try_ytdlp_instagram(url, tmp)
             except Exception as e:
                 print(f"[IG yt-dlp] {e}")
                 files = []
-
-            # 2) Instaloader sin login
             if not files:
                 try:
                     files = await _try_instaloader_instagram(url, tmp)
                 except Exception as e:
                     print(f"[IG instaloader] {e}")
                     files = []
-
-            # 3) Fallback OG
             if not files:
                 og = await _og_media_from_instagram(url)
                 for item in og:
@@ -503,7 +483,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 files.append(p)
                     except Exception as e:
                         print(f"[IG OG DL] {e}")
-
             if not files:
                 await update.message.reply_text("❌ No pude descargar ese enlace sin iniciar sesión.")
             else:
@@ -604,5 +583,5 @@ if __name__ == "__main__":
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("✅ Bot listo. Esperando mensajes...")
+    print("✅ Bot listo. Enviá un link para probar. DEBUG =", DEBUG)
     app.run_polling()
