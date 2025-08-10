@@ -1,3 +1,5 @@
+# bot.py — Adaptado con flujo Instagram estilo “Reels-Shorts” pero sin sesión (no instagrapi)
+
 import os
 import re
 import uuid
@@ -33,14 +35,15 @@ pending_youtube_links = {}
 # =========================
 # Utilidades generales
 # =========================
-TRAILING_GARBAGE = '),.?!…>]"\'’”»'  # caracteres que suelen quedar pegados al final
+ZERO_WIDTH = re.compile(r'[\u200B-\u200D\uFEFF]')
+TRAILING_GARBAGE = '),.?!…>]"\'’”»'
 
 def extraer_url_limpia(texto: str) -> str | None:
+    texto = ZERO_WIDTH.sub("", texto or "")
     m = re.search(r'https?://\S+', texto, flags=re.IGNORECASE)
     if not m:
         return None
     url = m.group(0).strip().rstrip(TRAILING_GARBAGE)
-    # Normaliza sin fragmento (#...)
     try:
         p = urllib.parse.urlsplit(url)
         url = urllib.parse.urlunsplit((p.scheme, p.netloc, p.path, p.query, ''))
@@ -79,8 +82,7 @@ async def manejar_eliminacion_segura(path):
     try:
         if isinstance(path, (list, tuple, set)):
             for p in path:
-                if p and os.path.exists(p):
-                    os.remove(p)
+                if p and os.path.exists(p): os.remove(p)
             return
         if path and os.path.exists(path):
             os.remove(path)
@@ -241,7 +243,7 @@ def obtener_tracks_album_spotify(album_url):
     return tracks, cover_url, album_name
 
 # =========================
-# Instagram (sin login): yt-dlp → instaloader → OG
+# Instagram (sin login): estilo “Reels-Shorts” pero sin instagrapi
 # =========================
 def _is_image(path: Path) -> bool:
     mime, _ = mimetypes.guess_type(str(path))
@@ -265,6 +267,7 @@ def _webp_to_jpg(p: Path) -> Path:
         return p
 
 def _ig_shortcode_from_url(url: str) -> str | None:
+    # soporta /p/, /reel/, /tv/
     m = re.search(r"(?:instagram\.com|instagr\.am)/(?:p|reel|tv)/([A-Za-z0-9_-]+)/?", url)
     return m.group(1) if m else None
 
@@ -288,6 +291,9 @@ async def _try_ytdlp_instagram(url: str, out_dir: Path):
     return files
 
 async def _try_instaloader_instagram(url: str, out_dir: Path):
+    """
+    Sin login. Inspira la lógica del repo: detecta shortcode y pide URLs directas.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     sc = _ig_shortcode_from_url(url)
     if not sc:
@@ -302,8 +308,7 @@ async def _try_instaloader_instagram(url: str, out_dir: Path):
             compress_json=False,
             post_metadata_txt_pattern=""
         )
-        ctx = L.context
-        post = Post.from_shortcode(ctx, sc)
+        post = Post.from_shortcode(L.context, sc)
 
         items = []
         if post.typename == "GraphSidecar":
@@ -369,8 +374,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     plataforma = detectar_plataforma(url)
-    # print(f"[DEBUG] URL detectada: {url} -> {plataforma}")  # descomenta si quieres ver logs
-
     procesando_msg = await update.message.reply_text("🔎 Procesando...")
 
     teclado = await obtener_teclado_odesli(url)
