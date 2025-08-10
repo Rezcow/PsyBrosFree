@@ -33,24 +33,22 @@ pending_youtube_links = {}
 # =========================
 # Utilidades generales
 # =========================
-TRAILING_GARBAGE = '),.。！？!…>]"\''"“”’"  # caracteres que suelen pegarse al final de una URL
+TRAILING_GARBAGE = '),.?!…>]"\'’”»'  # caracteres que suelen quedar pegados al final
 
 def extraer_url_limpia(texto: str) -> str | None:
     m = re.search(r'https?://\S+', texto, flags=re.IGNORECASE)
     if not m:
         return None
-    url = m.group(0).strip()
-    url = url.rstrip(TRAILING_GARBAGE)
+    url = m.group(0).strip().rstrip(TRAILING_GARBAGE)
+    # Normaliza sin fragmento (#...)
     try:
-        parsed = urllib.parse.urlsplit(url)
-        # reconstruimos sin fragment
-        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ''))
+        p = urllib.parse.urlsplit(url)
+        url = urllib.parse.urlunsplit((p.scheme, p.netloc, p.path, p.query, ''))
     except Exception:
         pass
     return url
 
 def limpiar_url_params(url: str) -> str:
-    # Para casos donde convenga quitar query entera
     try:
         p = urllib.parse.urlsplit(url)
         return urllib.parse.urlunsplit((p.scheme, p.netloc, p.path, '', ''))
@@ -59,7 +57,7 @@ def limpiar_url_params(url: str) -> str:
 
 def detectar_plataforma(url: str) -> str:
     u = url.lower()
-    if re.search(r'(?:^|://)(?:www\.)?(?:m\.)?(instagram\.com|instagr\.am)/', u):
+    if ("instagram.com/" in u) or ("instagr.am/" in u) or ("m.instagram.com/" in u):
         return "instagram"
     if "spotify.com/track/" in u:
         return "spotify_track"
@@ -371,6 +369,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     plataforma = detectar_plataforma(url)
+    # print(f"[DEBUG] URL detectada: {url} -> {plataforma}")  # descomenta si quieres ver logs
+
     procesando_msg = await update.message.reply_text("🔎 Procesando...")
 
     teclado = await obtener_teclado_odesli(url)
@@ -497,9 +497,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 ext = ".mp4" if item["type"] == "video" else ".jpg"
                                 p = tmp / f"ig_{uuid.uuid4().hex}{ext}"
                                 p.write_bytes(r.content)
+                                files.append(p)
                     except Exception as e:
                         print(f"[IG OG DL] {e}")
-                files = [p for p in tmp.glob("*") if p.stat().st_size > 0]
 
             if not files:
                 await update.message.reply_text("❌ No pude descargar ese enlace sin iniciar sesión.")
