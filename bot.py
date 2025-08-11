@@ -6,7 +6,6 @@ import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
-# ---------------- Logging ----------------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
@@ -15,22 +14,15 @@ log = logging.getLogger("odesli-only-bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# ---------------- Utils ----------------
 def extraer_url(text: str) -> str | None:
-    m = re.search(r"https?://\S+", text or "")
-    return m.group(0) if m else None
-
-def plataforma_permitida(url: str) -> bool:
-    u = url.lower()
-    if "music.youtube.com" in u:
-        return True
-    if "spotify.com" in u and "/track/" in u:
-        return True
-    if "music.apple.com" in u and ("/song/" in u or "?i=" in u):
-        return True
-    if "youtu.be" in u or "youtube.com" in u:
-        return True
-    return False  # instagram, twitter, etc. -> silencio
+    if not text:
+        return None
+    m = re.search(r"https?://\S+", text)
+    if not m:
+        return None
+    # limpia signos de cierre comunes pegados al final
+    url = m.group(0).rstrip(").,>]}\"'")
+    return url
 
 async def obtener_teclado_odesli(original_url: str):
     api = f"https://api.song.link/v1-alpha.1/links?url={original_url}"
@@ -41,13 +33,16 @@ async def obtener_teclado_odesli(original_url: str):
                 return None
             data = r.json()
             links = data.get("linksByPlatform", {})
+            if not links:
+                return None
             botones, fila = [], []
             for nombre, info in links.items():
                 url = info.get("url")
-                if url:
-                    fila.append(InlineKeyboardButton(text=nombre.capitalize(), url=url))
-                    if len(fila) == 3:
-                        botones.append(fila); fila = []
+                if not url:
+                    continue
+                fila.append(InlineKeyboardButton(text=nombre.capitalize(), url=url))
+                if len(fila) == 3:
+                    botones.append(fila); fila = []
             if fila:
                 botones.append(fila)
             return InlineKeyboardMarkup(botones) if botones else None
@@ -55,19 +50,15 @@ async def obtener_teclado_odesli(original_url: str):
         log.warning(f"Odesli error: {e}")
         return None
 
-# ---------------- Handler ----------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text if update.message else ""
-    url = extraer_url(text)
-    if not url or not plataforma_permitida(url):
-        return  # silencio
-
+    url = extraer_url(update.message.text if update.message else "")
+    if not url:
+        return
     teclado = await obtener_teclado_odesli(url)
     if teclado:
         await update.message.reply_text("🎶 Disponible en:", reply_markup=teclado)
-    # si Odesli falla, silencio también
+    # si Odesli no devuelve nada, silencio
 
-# limpiar webhook al iniciar (evita conflictos con polling)
 async def _post_init(app: Application):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -75,7 +66,6 @@ async def _post_init(app: Application):
     except Exception as e:
         log.warning(f"No pude limpiar webhook: {e}")
 
-# ---------------- Main ----------------
 if __name__ == "__main__":
     app = (Application.builder().token(BOT_TOKEN).post_init(_post_init).build())
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
