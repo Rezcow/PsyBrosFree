@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Reqs primero para aprovechar cache
+# Reqs primero para cache
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -15,7 +15,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py .
 
 ENV PYTHONUNBUFFERED=1
-# Opcional: logs de yt-dlp un poco más silenciosos
 ENV YTDLP_NO_UPDATE=1
 
 CMD ["python", "bot.py"]
