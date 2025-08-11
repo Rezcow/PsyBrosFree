@@ -28,7 +28,6 @@ def find_urls(text: str) -> list[str]:
     if not text:
         return []
     urls = [u.rstrip(").,>]}\"'") for u in URL_RE.findall(text)]
-    # opcional: dedup preservando orden
     seen, out = set(), []
     for u in urls:
         if u not in seen:
@@ -37,12 +36,11 @@ def find_urls(text: str) -> list[str]:
 
 def nice_name(key: str) -> str:
     k = key.lower()
-    # renombres pedidos
     if k == "spotify": return "Espotifai"
     if k == "youtube": return "Yutú"
     if k == "youtubemusic": return "Yutúmusic"
     if k == "applemusic": return "Manzanita"
-    # nombres bonitos por defecto
+    if k == "SoundCloud": return "SonClou"
     mapping = {
         "amazonmusic": "Amazon Music", "amazonstore": "Amazon Store",
         "anghami": "Anghami", "bandcamp": "Bandcamp", "deezer": "Deezer",
@@ -50,11 +48,10 @@ def nice_name(key: str) -> str:
         "tidal": "Tidal", "itunes": "iTunes", "yandex": "Yandex",
         "boomplay": "Boomplay", "audius": "Audius",
     }
-    if k in mapping: return mapping[k]
-    # fallback: capitalizar
-    return key.capitalize()
+    return mapping.get(k, key.capitalize())
 
-FAVORITES_ORDER = ["spotify", "youtubemusic", "applemusic", "youtube"]
+# Orden solicitado: Spotify, YouTube, YouTube Music, Apple Music, SoundCloud
+FAVORITES_ORDER = ["spotify", "youtube", "youtubemusic", "applemusic", "soundcloud"]
 
 async def fetch_odesli(url: str):
     """Devuelve (keyboard, title, artist, cover_url) o (None, None, None, None)."""
@@ -70,7 +67,6 @@ async def fetch_odesli(url: str):
         if not links:
             return None, None, None, None
 
-        # ordenar: favoritos primero, resto alfabético
         keys = list(links.keys())
         keys_sorted = (
             [k for k in FAVORITES_ORDER if k in keys] +
@@ -90,7 +86,6 @@ async def fetch_odesli(url: str):
             botones.append(fila)
         keyboard = InlineKeyboardMarkup(botones) if botones else None
 
-        # metadatos para título/portada
         uid = data.get("entityUniqueId")
         entity = data.get("entitiesByUniqueId", {}).get(uid, {}) if uid else {}
         title = entity.get("title")
@@ -113,15 +108,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("😕 busqué y busqué pero no encontré.")
             continue
 
-        caption_title = None
+        caption_title = "🎶 Disponible en:"
         if title and artist:
             caption_title = f"🎵 {title} — {artist}\n🎶 Disponible en:"
         elif title:
             caption_title = f"🎵 {title}\n🎶 Disponible en:"
-        else:
-            caption_title = "🎶 Disponible en:"
 
-        # si hay portada, la usamos como mensaje principal con el teclado
         if cover:
             try:
                 await context.bot.send_photo(
@@ -144,7 +136,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.inline_query.answer([], cache_time=10, is_personal=True)
         return
 
-    url = urls[0]  # tomamos el primero
+    url = urls[0]
     keyboard, title, artist, cover = await fetch_odesli(url)
     if not keyboard:
         await update.inline_query.answer([], cache_time=5, is_personal=True)
@@ -156,31 +148,18 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif title:
         caption = f"🎵 {title}\n🎶 Disponible en:"
 
-    results = []
     rid = str(uuid.uuid4())
-
     if cover:
-        results.append(
-            InlineQueryResultPhoto(
-                id=rid,
-                photo_url=cover,
-                thumb_url=cover,
-                caption=caption,
-                reply_markup=keyboard,
-                title=title or "Plataformas"
-            )
-        )
+        results = [InlineQueryResultPhoto(
+            id=rid, photo_url=cover, thumb_url=cover,
+            caption=caption, reply_markup=keyboard, title=title or "Plataformas"
+        )]
     else:
-        results.append(
-            InlineQueryResultArticle(
-                id=rid,
-                title=title or "Plataformas",
-                input_message_content=InputTextMessageContent(caption),
-                reply_markup=keyboard,
-                description="Enviar accesos a otras plataformas"
-            )
-        )
-
+        results = [InlineQueryResultArticle(
+            id=rid, title=title or "Plataformas",
+            input_message_content=InputTextMessageContent(caption),
+            reply_markup=keyboard, description="Enviar accesos a otras plataformas"
+        )]
     await update.inline_query.answer(results, cache_time=10, is_personal=True)
 
 # -------- Post-init / main --------
