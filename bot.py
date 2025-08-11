@@ -40,17 +40,17 @@ def nice_name(key: str) -> str:
     if k == "youtube": return "Yutú"
     if k == "youtubemusic": return "Yutúmusic"
     if k == "applemusic": return "Manzanita"
-    if k == "SoundCloud": return "SonClou"
+    if k == "soundcloud": return "SounClou"  # << cambio solicitado
     mapping = {
         "amazonmusic": "Amazon Music", "amazonstore": "Amazon Store",
         "anghami": "Anghami", "bandcamp": "Bandcamp", "deezer": "Deezer",
-        "napster": "Napster", "pandora": "Pandora", "soundcloud": "SoundCloud",
+        "napster": "Napster", "pandora": "Pandora",
         "tidal": "Tidal", "itunes": "iTunes", "yandex": "Yandex",
-        "boomplay": "Boomplay", "audius": "Audius",
+        "boomplay": "Boomplay", "audius": "Audius", "audiomack": "Audiomack",
     }
     return mapping.get(k, key.capitalize())
 
-# Orden solicitado: Spotify, YouTube, YouTube Music, Apple Music, SoundCloud
+# Orden preferido (minúsculas para comparar)
 FAVORITES_ORDER = ["spotify", "youtube", "youtubemusic", "applemusic", "soundcloud"]
 
 async def fetch_odesli(url: str):
@@ -68,10 +68,12 @@ async def fetch_odesli(url: str):
             return None, None, None, None
 
         keys = list(links.keys())
-        keys_sorted = (
-            [k for k in FAVORITES_ORDER if k in keys] +
-            sorted([k for k in keys if k not in FAVORITES_ORDER], key=lambda x: nice_name(x))
-        )
+        lower_to_orig = {k.lower(): k for k in keys}
+        fav_set = set(FAVORITES_ORDER)
+        fav_original = [lower_to_orig[k] for k in FAVORITES_ORDER if k in lower_to_orig]
+        others = [k for k in keys if k.lower() not in fav_set]
+        others_sorted = sorted(others, key=lambda x: nice_name(x.lower()))
+        keys_sorted = fav_original + others_sorted
 
         botones, fila = [], []
         for k in keys_sorted:
