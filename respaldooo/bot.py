@@ -1,5 +1,3 @@
-# bot.py — PsyBrosBot (YouTube + Spotify/Apple/YT Music) — clean & Railway-friendly
-
 import os
 import re
 import uuid
@@ -8,25 +6,22 @@ import logging
 import httpx
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
-)
+from telegram.ext import Application, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-# ---------------- Config & logging ----------------
+# ---------------- Logging ----------------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 log = logging.getLogger("psybot")
 
+# ---------------- Config ----------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# ---- yt-dlp endurecido + cookies opcionales ----
-YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES_YT")  # contenido Netscape del cookies.txt (opcional)
+# Cookies opcionales para YouTube (pega aquí el contenido Netscape en la var de entorno)
+YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES_YT")
 COOKIES_FILE = None
 if YTDLP_COOKIES:
     os.makedirs("cookies", exist_ok=True)
@@ -47,7 +42,7 @@ YTDLP_BASE = [
 if COOKIES_FILE:
     YTDLP_BASE += ["--cookies", COOKIES_FILE]
 
-# enlaces youtube en espera (para botones)
+# Enlaces pendientes para botones YT
 pending_youtube_links = {}
 
 # ---------------- Utils ----------------
@@ -65,9 +60,9 @@ def plataforma_permitida(url: str) -> str | None:
         return "apple_music"
     if "youtu.be" in u or "youtube.com" in u:
         return "youtube"
-    return None  # todo lo demás (instagram, etc) se ignora
+    return None  # todo lo demás (instagram, twitter, etc.) se ignora
 
-async def manejar_eliminacion_segura(path):
+async def safe_rm(path: str):
     try:
         if path and os.path.exists(path):
             os.remove(path)
@@ -75,10 +70,10 @@ async def manejar_eliminacion_segura(path):
         log.warning(f"Error al eliminar {path}: {e}")
 
 async def obtener_teclado_odesli(original_url: str):
-    api_url = f"https://api.song.link/v1-alpha.1/links?url={original_url}"
+    api = f"https://api.song.link/v1-alpha.1/links?url={original_url}"
     try:
         async with httpx.AsyncClient() as client:
-            r = await client.get(api_url, timeout=12)
+            r = await client.get(api, timeout=12)
             if r.status_code != 200:
                 return None
             data = r.json()
@@ -98,10 +93,10 @@ async def obtener_teclado_odesli(original_url: str):
         return None
 
 async def obtener_titulo_artista_con_odesli(url: str):
-    api_url = f"https://api.song.link/v1-alpha.1/links?url={url}"
+    api = f"https://api.song.link/v1-alpha.1/links?url={url}"
     try:
         async with httpx.AsyncClient() as client:
-            r = await client.get(api_url, timeout=12)
+            r = await client.get(api, timeout=12)
             if r.status_code != 200:
                 return None, None
             data = r.json()
@@ -113,62 +108,55 @@ async def obtener_titulo_artista_con_odesli(url: str):
         return None, None
 
 # ---------------- yt-dlp helpers ----------------
-async def _ytdlp_print_path(cmd: list[str]) -> tuple[int, str, str, str]:
+def _ytdlp_print_path(cmd: list[str]) -> tuple[int, str, str, str]:
     """Ejecuta yt-dlp y devuelve (rc, stdout, stderr, final_path)."""
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    out_lines = (proc.stdout or "").strip().splitlines()
-    final_path = out_lines[-1] if out_lines else ""
+    lines = (proc.stdout or "").strip().splitlines()
+    final_path = lines[-1] if lines else ""
     return proc.returncode, proc.stdout, proc.stderr, final_path
 
 async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
-    """Busca en YouTube y extrae a MP3."""
     template = os.path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s")
-    cmd = [
-        "yt-dlp", f"ytsearch1:{query}",
-        "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
-        "-o", template, "--print", "after_move:filepath",
-    ] + YTDLP_BASE
+    cmd = ["yt-dlp", f"ytsearch1:{query}",
+           "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
+           "-o", template, "--print", "after_move:filepath"] + YTDLP_BASE
+    rc, so, se, path = _ytdlp_print_path(cmd)
 
-    rc, so, se, final_path = await _ytdlp_print_path(cmd)
-
-    # Fallback: cambia cliente a iOS si “confirm you’re not a bot”
+    # Fallback a iOS si YouTube pide “confirm you’re not a bot”
     if rc != 0 and "confirm you’re not a bot" in (se or "") and "--cookies" not in YTDLP_BASE:
-        cmd_ios = cmd[:]
-        i = cmd_ios.index("--extractor-args") + 1
-        cmd_ios[i] = "youtube:player_client=ios"
-        rc, so, se, final_path = await _ytdlp_print_path(cmd_ios)
+        cmd_ios = cmd.copy()
+        ios_arg = "youtube:player_client=ios"
+        cmd_ios[cmd_ios.index("youtube:player_client=android")] = ios_arg
+        rc, so, se, path = _ytdlp_print_path(cmd_ios)
 
-    if rc == 0 and final_path and os.path.exists(final_path):
+    if rc == 0 and path and os.path.exists(path):
         try:
-            with open(final_path, "rb") as f:
+            with open(path, "rb") as f:
                 await context.bot.send_audio(chat_id=chat_id, audio=f, title=query)
         finally:
-            await manejar_eliminacion_segura(final_path)
+            await safe_rm(path)
     else:
-        err = (se or "")[:300]
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ No se generó audio.\n{err}")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ No se generó audio.\n{(se or '')[:300]}")
 
 async def descargar_audio_youtube(url: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
     template = os.path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s")
-    cmd = [
-        "yt-dlp", url,
-        "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
-        "-o", template, "--print", "after_move:filepath",
-    ] + YTDLP_BASE
+    cmd = ["yt-dlp", url,
+           "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
+           "-o", template, "--print", "after_move:filepath"] + YTDLP_BASE
+    rc, so, se, path = _ytdlp_print_path(cmd)
 
-    rc, so, se, final_path = await _ytdlp_print_path(cmd)
     if rc != 0 and "confirm you’re not a bot" in (se or "") and "--cookies" not in YTDLP_BASE:
-        cmd_ios = cmd[:]
-        i = cmd_ios.index("--extractor-args") + 1
-        cmd_ios[i] = "youtube:player_client=ios"
-        rc, so, se, final_path = await _ytdlp_print_path(cmd_ios)
+        cmd_ios = cmd.copy()
+        ios_arg = "youtube:player_client=ios"
+        cmd_ios[cmd_ios.index("youtube:player_client=android")] = ios_arg
+        rc, so, se, path = _ytdlp_print_path(cmd_ios)
 
-    if rc == 0 and final_path and os.path.exists(final_path):
+    if rc == 0 and path and os.path.exists(path):
         try:
-            with open(final_path, "rb") as f:
+            with open(path, "rb") as f:
                 await context.bot.send_audio(chat_id=chat_id, audio=f)
         finally:
-            await manejar_eliminacion_segura(final_path)
+            await safe_rm(path)
     else:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ No pude extraer audio.\n{(se or '')[:300]}")
 
@@ -178,9 +166,9 @@ async def descargar_video_youtube(url: str, chat_id, context: ContextTypes.DEFAU
     proc = subprocess.run(cmd, capture_output=True, text=True)
 
     if proc.returncode != 0 and "confirm you’re not a bot" in (proc.stderr or "") and "--cookies" not in YTDLP_BASE:
-        cmd_ios = cmd[:]
-        i = cmd_ios.index("--extractor-args") + 1
-        cmd_ios[i] = "youtube:player_client=ios"
+        cmd_ios = cmd.copy()
+        ios_arg = "youtube:player_client=ios"
+        cmd_ios[cmd_ios.index("youtube:player_client=android")] = ios_arg
         proc = subprocess.run(cmd_ios, capture_output=True, text=True)
 
     if proc.returncode == 0 and os.path.exists(filename):
@@ -188,7 +176,7 @@ async def descargar_video_youtube(url: str, chat_id, context: ContextTypes.DEFAU
             with open(filename, "rb") as f:
                 await context.bot.send_video(chat_id=chat_id, video=f)
         finally:
-            await manejar_eliminacion_segura(filename)
+            await safe_rm(filename)
     else:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ YouTube error.\n{(proc.stderr or '')[:300]}")
 
@@ -201,7 +189,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     plataforma = plataforma_permitida(url)
     if not plataforma:
-        return  # ignorar cualquier otra cosa (instagram, twitter, etc.)
+        return  # ignora instagram, twitter, etc.
 
     chat_id = update.effective_chat.id
     procesando = await update.message.reply_text("🔎 Procesando...")
@@ -212,7 +200,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if plataforma == "youtube":
-            # Botones Audio / Video
             link_id = str(uuid.uuid4())
             pending_youtube_links[link_id] = url
             botones = [[
@@ -220,8 +207,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🎵 Audio", callback_data=f"ytaudio|{link_id}|{chat_id}")
             ]]
             await update.message.reply_text("¿Qué formato deseas recibir?", reply_markup=InlineKeyboardMarkup(botones))
-
-        else:  # spotify_track / ytmusic / apple_music
+        else:
             title, artist = await obtener_titulo_artista_con_odesli(url)
             if not title:
                 await update.message.reply_text("❌ No se pudo extraer título/artista.")
@@ -229,40 +215,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query = f"{title} {artist or ''}".strip()
             await update.message.reply_text(f"🔍 Buscando en YouTube: {query}")
             await buscar_y_descargar(query, chat_id, context)
-
     finally:
-        try:
-            await procesando.delete()
-        except:
-            pass
+        try: await procesando.delete()
+        except: pass
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data or ""
-
     if data.startswith("ytvideo|") or data.startswith("ytaudio|"):
         tipo, link_id, chat_id = data.split("|", 2)
         url = pending_youtube_links.get(link_id)
         if not url:
             await context.bot.send_message(chat_id=int(chat_id), text="❌ Enlace expirado o no encontrado.")
             return
-
         if tipo == "ytvideo":
             await context.bot.send_message(chat_id=int(chat_id), text="⏳ Descargando video…")
             await descargar_video_youtube(url, int(chat_id), context)
         else:
             await context.bot.send_message(chat_id=int(chat_id), text="⏳ Extrayendo audio…")
             await descargar_audio_youtube(url, int(chat_id), context)
-
         pending_youtube_links.pop(link_id, None)
 
-# Borrar webhook al arrancar (evita conflictos con polling)
+# limpiar webhook al arrancar (evita conflictos con polling)
 async def _post_init(app: Application):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Webhook eliminado (si había). Polling limpio.")
-        # opcional: imprime versiones
+        log.info("Webhook eliminado; polling limpio.")
         log.info("yt-dlp: %s", subprocess.getoutput("yt-dlp --version"))
         log.info("ffmpeg: %s", subprocess.getoutput("ffmpeg -version").splitlines()[0])
     except Exception as e:
