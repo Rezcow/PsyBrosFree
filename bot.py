@@ -20,29 +20,18 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# Cookies opcionales para YouTube (contenido Netscape en var YTDLP_COOKIES_YT)
-YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES_YT")
-COOKIES_FILE = None
-if YTDLP_COOKIES:
-    os.makedirs("cookies", exist_ok=True)
-    COOKIES_FILE = "cookies/youtube.txt"
-    with open(COOKIES_FILE, "w", encoding="utf-8") as f:
-        f.write(YTDLP_COOKIES)
-    log.info("Cookies de YouTube cargadas.")
-
+# yt-dlp: sin cookies, endurecido + móvil
 YTDLP_BASE = [
     "--no-warnings",
     "--restrict-filenames",
     "--no-playlist",
+    "--force-ipv4",  # a veces ayuda en cloud
     "--add-header", "User-Agent: Mozilla/5.0",
     "--add-header", "Referer: https://www.youtube.com/",
     "--extractor-args", "youtube:player_client=android",  # cliente móvil
     "--geo-bypass",
 ]
-if COOKIES_FILE:
-    YTDLP_BASE += ["--cookies", COOKIES_FILE]
 
-# Enlaces pendientes para botones YT
 pending_youtube_links = {}
 
 # ---------------- Utils ----------------
@@ -60,7 +49,7 @@ def plataforma_permitida(url: str) -> str | None:
         return "apple_music"
     if "youtu.be" in u or "youtube.com" in u:
         return "youtube"
-    return None  # ignora instagram, twitter, etc.
+    return None  # todo lo demás se ignora
 
 async def safe_rm(path: str):
     try:
@@ -109,14 +98,12 @@ async def obtener_titulo_artista_con_odesli(url: str):
 
 # ---------------- yt-dlp helpers ----------------
 def _run_and_path(cmd: list[str]) -> tuple[int, str, str, str]:
-    """Ejecuta yt-dlp y devuelve (rc, stdout, stderr, final_path)."""
     proc = subprocess.run(cmd, capture_output=True, text=True)
     lines = (proc.stdout or "").strip().splitlines()
     final_path = lines[-1] if lines else ""
     return proc.returncode, proc.stdout, proc.stderr, final_path
 
 def _with_ios(cmd: list[str]) -> list[str]:
-    """Cambia player_client=android -> ios dentro del comando."""
     c = cmd[:]
     if "--extractor-args" in c:
         i = c.index("--extractor-args") + 1
@@ -124,15 +111,31 @@ def _with_ios(cmd: list[str]) -> list[str]:
             c[i] = "youtube:player_client=ios"
     return c
 
+def _is_bot_block(stderr: str) -> bool:
+    s = (stderr or "").lower()
+    return "confirm you’re not a bot" in s or "confirm you're not a bot" in s
+
 async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
     template = os.path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s")
-    cmd = ["yt-dlp", f"ytsearch1:{query}",
-           "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
-           "-o", template, "--print", "after_move:filepath"] + YTDLP_BASE
-    rc, so, se, path = _run_and_path(cmd)
 
-    if rc != 0 and "confirm you’re not a bot" in (se or "") and "--cookies" not in YTDLP_BASE:
-        rc, so, se, path = _run_and_path(_with_ios(cmd))
+    async def _try(search_str: str):
+        cmd = ["yt-dlp", f"ytsearch1:{search_str}",
+               "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
+               "-o", template, "--print", "after_move:filepath"] + YTDLP_BASE
+        rc, so, se, path = _run_and_path(cmd)
+        if rc != 0 and _is_bot_block(se):
+            rc, so, se, path = _run_and_path(_with_ios(cmd))
+        return rc, se, path
+
+    # 1) consulta directa
+    rc, se, path = await _try(query)
+
+    # 2) si falla, probamos variantes (a veces evita el bloqueo)
+    if rc != 0:
+        for suffix in [" official audio", " topic", " lyrics"]:
+            rc, se, path = await _try(query + suffix)
+            if rc == 0:
+                break
 
     if rc == 0 and path and os.path.exists(path):
         try:
@@ -141,7 +144,10 @@ async def buscar_y_descargar(query: str, chat_id, context: ContextTypes.DEFAULT_
         finally:
             await safe_rm(path)
     else:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ No se generó audio.\n{(se or '')[:300]}")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ No se generó audio (YouTube bloqueó la solicitud). Intenta otra vez o prueba con otro tema."
+        )
 
 async def descargar_audio_youtube(url: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
     template = os.path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s")
@@ -149,8 +155,7 @@ async def descargar_audio_youtube(url: str, chat_id, context: ContextTypes.DEFAU
            "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
            "-o", template, "--print", "after_move:filepath"] + YTDLP_BASE
     rc, so, se, path = _run_and_path(cmd)
-
-    if rc != 0 and "confirm you’re not a bot" in (se or "") and "--cookies" not in YTDLP_BASE:
+    if rc != 0 and _is_bot_block(se):
         rc, so, se, path = _run_and_path(_with_ios(cmd))
 
     if rc == 0 and path and os.path.exists(path):
@@ -160,14 +165,13 @@ async def descargar_audio_youtube(url: str, chat_id, context: ContextTypes.DEFAU
         finally:
             await safe_rm(path)
     else:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ No pude extraer audio.\n{(se or '')[:300]}")
+        await context.bot.send_message(chat_id=chat_id, text="❌ No pude extraer audio de ese video ahora mismo.")
 
 async def descargar_video_youtube(url: str, chat_id, context: ContextTypes.DEFAULT_TYPE):
     filename = os.path.join(DOWNLOADS_DIR, "youtube.mp4")
     cmd = ["yt-dlp", "-f", "mp4", "-o", filename, url] + YTDLP_BASE
     proc = subprocess.run(cmd, capture_output=True, text=True)
-
-    if proc.returncode != 0 and "confirm you’re not a bot" in (proc.stderr or "") and "--cookies" not in YTDLP_BASE:
+    if proc.returncode != 0 and _is_bot_block(proc.stderr):
         proc = subprocess.run(_with_ios(cmd), capture_output=True, text=True)
 
     if proc.returncode == 0 and os.path.exists(filename):
@@ -177,20 +181,17 @@ async def descargar_video_youtube(url: str, chat_id, context: ContextTypes.DEFAU
         finally:
             await safe_rm(filename)
     else:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ YouTube error.\n{(proc.stderr or '')[:300]}")
+        await context.bot.send_message(chat_id=chat_id, text="❌ No pude descargar el video ahora mismo.")
 
 # ---------------- Handlers ----------------
-def _platform(url: str) -> str | None:
-    return plataforma_permitida(url)
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text if update.message else ""
     url = extraer_url(text)
     if not url:
         return
-    plataforma = _platform(url)
+    plataforma = plataforma_permitida(url)
     if not plataforma:
-        return  # ignoramos todo lo demás
+        return  # ignoramos instagram, twitter, etc.
 
     chat_id = update.effective_chat.id
     procesando = await update.message.reply_text("🔎 Procesando...")
@@ -217,10 +218,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🔍 Buscando en YouTube: {query}")
             await buscar_y_descargar(query, chat_id, context)
     finally:
-        try:
-            await procesando.delete()
-        except:
-            pass
+        try: await procesando.delete()
+        except: pass
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -240,7 +239,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await descargar_audio_youtube(url, int(chat_id), context)
         pending_youtube_links.pop(link_id, None)
 
-# limpiar webhook al arrancar (evita conflicto con polling)
+# limpiar webhook al arrancar
 async def _post_init(app: Application):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
