@@ -3,13 +3,15 @@ import re
 import uuid
 import logging
 import httpx
+from collections import deque
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InlineQueryResultArticle, InlineQueryResultPhoto, InputTextMessageContent
 )
 from telegram.ext import (
-    Application, MessageHandler, ContextTypes, filters, InlineQueryHandler
+    Application, MessageHandler, ContextTypes, filters,
+    InlineQueryHandler, CallbackQueryHandler
 )
 
 # -------- Logging --------
@@ -40,7 +42,7 @@ def nice_name(key: str) -> str:
     if k == "youtube": return "Yutú"
     if k == "youtubemusic": return "Yutúmusic"
     if k == "applemusic": return "Manzanita"
-    if k == "soundcloud": return "SounClou"  # << cambio solicitado
+    if k == "soundcloud": return "SounClou"   # etiqueta personalizada
     mapping = {
         "amazonmusic": "Amazon Music", "amazonstore": "Amazon Store",
         "anghami": "Anghami", "bandcamp": "Bandcamp", "deezer": "Deezer",
@@ -50,11 +52,58 @@ def nice_name(key: str) -> str:
     }
     return mapping.get(k, key.capitalize())
 
-# Orden preferido (minúsculas para comparar)
-FAVORITES_ORDER = ["spotify", "youtube", "youtubemusic", "applemusic", "soundcloud"]
+FAVS_LOWER = ["spotify", "youtube", "youtubemusic", "applemusic", "soundcloud"]
+
+def sort_keys(links: dict) -> list[str]:
+    keys = list(links.keys())
+    lower_to_orig = {k.lower(): k for k in keys}
+    fav_present = [lower_to_orig[k] for k in FAVS_LOWER if k in lower_to_orig]
+    others = [k for k in keys if k.lower() not in set(FAVS_LOWER)]
+    others_sorted = sorted(others, key=lambda x: nice_name(x.lower()))
+    return fav_present + others_sorted
+
+# Guardamos tablas de links para callbacks (máx 300)
+STORE: dict[str, dict] = {}
+ORDER = deque(maxlen=300)
+def remember_links(links: dict) -> str:
+    key = uuid.uuid4().hex
+    STORE[key] = links
+    ORDER.append(key)
+    # limpieza simple (deque ya recorta; removemos huérfanos)
+    while len(STORE) > ORDER.maxlen:
+        old = ORDER.popleft()
+        STORE.pop(old, None)
+    return key
+
+def build_keyboard(links: dict, show_all: bool, key: str) -> InlineKeyboardMarkup:
+    sorted_keys = sort_keys(links)
+    if show_all:
+        keys_to_show = sorted_keys
+    else:
+        keys_to_show = [k for k in sorted_keys if k.lower() in set(FAVS_LOWER)]
+
+    botones, fila = [], []
+    for k in keys_to_show:
+        url = links[k].get("url")
+        if not url:
+            continue
+        label = nice_name(k)
+        fila.append(InlineKeyboardButton(text=label, url=url))
+        if len(fila) == 3:
+            botones.append(fila); fila = []
+    if fila:
+        botones.append(fila)
+
+    # Añadir botón para expandir/colapsar si hay más plataformas
+    if not show_all and len(keys_to_show) < len(sorted_keys):
+        botones.append([InlineKeyboardButton("Más opciones ▾", callback_data=f"more|{key}")])
+    elif show_all:
+        botones.append([InlineKeyboardButton("◀ Menos opciones", callback_data=f"less|{key}")])
+
+    return InlineKeyboardMarkup(botones)
 
 async def fetch_odesli(url: str):
-    """Devuelve (keyboard, title, artist, cover_url) o (None, None, None, None)."""
+    """Devuelve (links_by_platform, title, artist, cover_url)."""
     api = f"https://api.song.link/v1-alpha.1/links?url={url}"
     try:
         async with httpx.AsyncClient() as client:
@@ -62,39 +111,10 @@ async def fetch_odesli(url: str):
         if r.status_code != 200:
             return None, None, None, None
         data = r.json()
-
         links = data.get("linksByPlatform", {}) or {}
-        if not links:
-            return None, None, None, None
-
-        keys = list(links.keys())
-        lower_to_orig = {k.lower(): k for k in keys}
-        fav_set = set(FAVORITES_ORDER)
-        fav_original = [lower_to_orig[k] for k in FAVORITES_ORDER if k in lower_to_orig]
-        others = [k for k in keys if k.lower() not in fav_set]
-        others_sorted = sorted(others, key=lambda x: nice_name(x.lower()))
-        keys_sorted = fav_original + others_sorted
-
-        botones, fila = [], []
-        for k in keys_sorted:
-            u = links[k].get("url")
-            if not u:
-                continue
-            label = nice_name(k)
-            fila.append(InlineKeyboardButton(text=label, url=u))
-            if len(fila) == 3:
-                botones.append(fila); fila = []
-        if fila:
-            botones.append(fila)
-        keyboard = InlineKeyboardMarkup(botones) if botones else None
-
         uid = data.get("entityUniqueId")
         entity = data.get("entitiesByUniqueId", {}).get(uid, {}) if uid else {}
-        title = entity.get("title")
-        artist = entity.get("artistName")
-        cover = entity.get("thumbnailUrl")
-
-        return keyboard, title, artist, cover
+        return links or None, entity.get("title"), entity.get("artistName"), entity.get("thumbnailUrl")
     except Exception as e:
         log.warning(f"Odesli error: {e}")
         return None, None, None, None
@@ -105,30 +125,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not urls:
         return
     for url in urls:
-        keyboard, title, artist, cover = await fetch_odesli(url)
-        if not keyboard:
+        links, title, artist, cover = await fetch_odesli(url)
+        if not links:
             await update.message.reply_text("😕 busqué y busqué pero no encontré.")
             continue
 
-        caption_title = "🎶 Disponible en:"
+        key = remember_links(links)
+        keyboard = build_keyboard(links, show_all=False, key=key)
+
+        caption = "🎶 Disponible en:"
         if title and artist:
-            caption_title = f"🎵 {title} — {artist}\n🎶 Disponible en:"
+            caption = f"🎵 {title} — {artist}\n🎶 Disponible en:"
         elif title:
-            caption_title = f"🎵 {title}\n🎶 Disponible en:"
+            caption = f"🎵 {title}\n🎶 Disponible en:"
 
         if cover:
             try:
                 await context.bot.send_photo(
                     chat_id=update.effective_chat.id,
                     photo=cover,
-                    caption=caption_title,
+                    caption=caption,
                     reply_markup=keyboard
                 )
                 continue
             except Exception as e:
                 log.info(f"No pude usar la portada, envío texto. {e}")
 
-        await update.message.reply_text(caption_title, reply_markup=keyboard)
+        await update.message.reply_text(caption, reply_markup=keyboard)
 
 # -------- Inline mode --------
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -139,10 +162,13 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     url = urls[0]
-    keyboard, title, artist, cover = await fetch_odesli(url)
-    if not keyboard:
+    links, title, artist, cover = await fetch_odesli(url)
+    if not links:
         await update.inline_query.answer([], cache_time=5, is_personal=True)
         return
+
+    key = remember_links(links)
+    keyboard = build_keyboard(links, show_all=False, key=key)
 
     caption = "🎶 Disponible en:"
     if title and artist:
@@ -164,6 +190,36 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         )]
     await update.inline_query.answer(results, cache_time=10, is_personal=True)
 
+# -------- Callbacks (expandir/colapsar) --------
+async def toggle_more_less(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    await cq.answer()
+    data = cq.data or ""
+    if not (data.startswith("more|") or data.startswith("less|")):
+        return
+    _, key = data.split("|", 1)
+    links = STORE.get(key)
+    if not links:
+        return
+
+    show_all = data.startswith("more|")
+    keyboard = build_keyboard(links, show_all=show_all, key=key)
+
+    try:
+        if cq.inline_message_id:
+            await context.bot.edit_message_reply_markup(
+                inline_message_id=cq.inline_message_id,
+                reply_markup=keyboard
+            )
+        else:
+            await context.bot.edit_message_reply_markup(
+                chat_id=cq.message.chat_id,
+                message_id=cq.message.message_id,
+                reply_markup=keyboard
+            )
+    except Exception as e:
+        log.warning(f"No pude editar el teclado: {e}")
+
 # -------- Post-init / main --------
 async def _post_init(app: Application):
     try:
@@ -176,5 +232,6 @@ if __name__ == "__main__":
     app = (Application.builder().token(BOT_TOKEN).post_init(_post_init).build())
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(InlineQueryHandler(handle_inline_query))
+    app.add_handler(CallbackQueryHandler(toggle_more_less))
     log.info("✅ Bot listo. Escribe o usa @Bot en cualquier chat.")
     app.run_polling(drop_pending_updates=True)
