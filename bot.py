@@ -4,7 +4,7 @@ import uuid
 import logging
 import httpx
 from collections import deque
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -15,7 +15,7 @@ from telegram.ext import (
     InlineQueryHandler, CallbackQueryHandler
 )
 
-# -------- Logging --------
+# -------- Config / Logging --------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
@@ -23,18 +23,20 @@ logging.basicConfig(
 log = logging.getLogger("odesli-bot-plus")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+COUNTRY = os.environ.get("ODESLI_COUNTRY", "CL").upper()  # << región preferida (CL por defecto)
 
 # -------- Utils --------
 URL_RE = re.compile(r"https?://\S+")
 
-# dominios considerados "musicales" (para filtrar Instagram, etc.)
+# dominios musicales (para ignorar Instagram, etc.)
 MUSIC_DOMAINS = (
-    "spotify.com", "music.apple.com", "itunes.apple.com",
+    "spotify.com",
+    "music.apple.com", "itunes.apple.com", "geo.music.apple.com",
     "youtube.com", "youtu.be", "music.youtube.com",
     "soundcloud.com", "bandcamp.com", "tidal.com", "deezer.com",
     "pandora.com", "yandex", "napster.com", "audiomack.com",
     "anghami.com", "boomplay.com", "amazonmusic.com", "music.amazon.",
-    "audius.co"
+    "audius.co",
 )
 
 def is_music_url(url: str) -> bool:
@@ -80,6 +82,44 @@ def sort_keys(links: dict) -> list[str]:
     others_sorted = sorted(others, key=lambda x: nice_name(x.lower()))
     return fav_present + others_sorted
 
+# ---- Regionalización Apple Music ----
+def _regionalize_apple(url: str) -> str:
+    """Forza región en enlaces de Apple Music a COUNTRY y limpia tracking."""
+    try:
+        p = urlparse(url)
+        host = p.netloc.lower()
+        if "music.apple.com" in host or "geo.music.apple.com" in host or "itunes.apple.com" in host:
+            # host: usar music.apple.com
+            host = "music.apple.com"
+            # path: /{cc}/resto ... -> cambia cc a COUNTRY (si existe)
+            parts = p.path.strip("/").split("/", 1)
+            if parts and len(parts[0]) == 2:
+                parts[0] = COUNTRY.lower()
+                new_path = "/" + "/".join(parts)
+            else:
+                new_path = f"/{COUNTRY.lower()}/{p.path.strip('/')}"
+            # query: conservar solo ?i=... (si existe)
+            q = parse_qs(p.query)
+            new_q = {}
+            if "i" in q and q["i"]:
+                new_q["i"] = q["i"][0]
+            return urlunparse((p.scheme, host, new_path, "", urlencode(new_q) if new_q else "", ""))
+    except Exception as e:
+        log.debug(f"No pude regionalizar Apple Music: {e}")
+    return url
+
+def regionalize_links(links: dict) -> dict:
+    """Crea una copia con Apple Music ajustado a la región preferida."""
+    out = {}
+    for k, info in links.items():
+        url = info.get("url")
+        if not url:
+            continue
+        if k.lower() in ("applemusic", "itunes"):
+            url = _regionalize_apple(url)
+        out[k] = {**info, "url": url}
+    return out
+
 # almacenamiento simple para callbacks
 STORE: dict[str, dict] = {}
 ORDER = deque(maxlen=300)
@@ -94,10 +134,9 @@ def remember_links(links: dict) -> str:
 
 def build_keyboard(links: dict, show_all: bool, key: str) -> InlineKeyboardMarkup:
     sorted_keys = sort_keys(links)
-    if show_all:
-        keys_to_show = sorted_keys
-    else:
-        keys_to_show = [k for k in sorted_keys if k.lower() in set(FAVS_LOWER)]
+    keys_to_show = (
+        sorted_keys if show_all else [k for k in sorted_keys if k.lower() in set(FAVS_LOWER)]
+    )
 
     botones, fila = [], []
     for k in keys_to_show:
@@ -119,14 +158,18 @@ def build_keyboard(links: dict, show_all: bool, key: str) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(botones)
 
 async def fetch_odesli(url: str):
-    api = f"https://api.song.link/v1-alpha.1/links?url={url}"
+    """Devuelve (links_by_platform, title, artist, cover_url)."""
+    api = "https://api.song.link/v1-alpha.1/links"
+    params = {"url": url, "userCountry": COUNTRY}   # << fuerza región
+    headers = {"Accept-Language": f"es-{COUNTRY},es;q=0.9,en;q=0.8"}
     try:
         async with httpx.AsyncClient() as client:
-            r = await client.get(api, timeout=12)
+            r = await client.get(api, params=params, headers=headers, timeout=12)
         if r.status_code != 200:
             return None, None, None, None
         data = r.json()
-        links = data.get("linksByPlatform", {}) or {}
+        raw_links = data.get("linksByPlatform", {}) or {}
+        links = regionalize_links(raw_links)  # ajusta Apple Music
         uid = data.get("entityUniqueId")
         entity = data.get("entitiesByUniqueId", {}).get(uid, {}) if uid else {}
         return links or None, entity.get("title"), entity.get("artistName"), entity.get("thumbnailUrl")
@@ -141,8 +184,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     for url in urls:
         if not is_music_url(url):
-            # enlaces no musicales (Instagram, etc.) -> silencio
-            continue
+            continue  # silencio para no-musicales (Instagram, etc.)
 
         links, title, artist, cover = await fetch_odesli(url)
         if not links:
@@ -172,7 +214,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(caption, reply_markup=keyboard)
 
-# -------- Inline mode (también ignora links no musicales) --------
+# -------- Inline mode --------
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = (update.inline_query.query or "").strip()
     urls = find_urls(q)
