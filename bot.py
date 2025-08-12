@@ -4,6 +4,7 @@ import uuid
 import logging
 import httpx
 from collections import deque
+from urllib.parse import urlparse
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -26,6 +27,23 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 # -------- Utils --------
 URL_RE = re.compile(r"https?://\S+")
 
+# dominios considerados "musicales" (para filtrar Instagram, etc.)
+MUSIC_DOMAINS = (
+    "spotify.com", "music.apple.com", "itunes.apple.com",
+    "youtube.com", "youtu.be", "music.youtube.com",
+    "soundcloud.com", "bandcamp.com", "tidal.com", "deezer.com",
+    "pandora.com", "yandex", "napster.com", "audiomack.com",
+    "anghami.com", "boomplay.com", "amazonmusic.com", "music.amazon.",
+    "audius.co"
+)
+
+def is_music_url(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+        return any(d in host for d in MUSIC_DOMAINS)
+    except Exception:
+        return False
+
 def find_urls(text: str) -> list[str]:
     if not text:
         return []
@@ -42,7 +60,7 @@ def nice_name(key: str) -> str:
     if k == "youtube": return "Yutú"
     if k == "youtubemusic": return "Yutúmusic"
     if k == "applemusic": return "Manzanita"
-    if k == "soundcloud": return "SounClou"   # etiqueta personalizada
+    if k == "soundcloud": return "SounClou"
     mapping = {
         "amazonmusic": "Amazon Music", "amazonstore": "Amazon Store",
         "anghami": "Anghami", "bandcamp": "Bandcamp", "deezer": "Deezer",
@@ -62,14 +80,13 @@ def sort_keys(links: dict) -> list[str]:
     others_sorted = sorted(others, key=lambda x: nice_name(x.lower()))
     return fav_present + others_sorted
 
-# Guardamos tablas de links para callbacks (máx 300)
+# almacenamiento simple para callbacks
 STORE: dict[str, dict] = {}
 ORDER = deque(maxlen=300)
 def remember_links(links: dict) -> str:
     key = uuid.uuid4().hex
     STORE[key] = links
     ORDER.append(key)
-    # limpieza simple (deque ya recorta; removemos huérfanos)
     while len(STORE) > ORDER.maxlen:
         old = ORDER.popleft()
         STORE.pop(old, None)
@@ -94,7 +111,6 @@ def build_keyboard(links: dict, show_all: bool, key: str) -> InlineKeyboardMarku
     if fila:
         botones.append(fila)
 
-    # Añadir botón para expandir/colapsar si hay más plataformas
     if not show_all and len(keys_to_show) < len(sorted_keys):
         botones.append([InlineKeyboardButton("Más opciones ▾", callback_data=f"more|{key}")])
     elif show_all:
@@ -103,7 +119,6 @@ def build_keyboard(links: dict, show_all: bool, key: str) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(botones)
 
 async def fetch_odesli(url: str):
-    """Devuelve (links_by_platform, title, artist, cover_url)."""
     api = f"https://api.song.link/v1-alpha.1/links?url={url}"
     try:
         async with httpx.AsyncClient() as client:
@@ -119,12 +134,16 @@ async def fetch_odesli(url: str):
         log.warning(f"Odesli error: {e}")
         return None, None, None, None
 
-# -------- Chat handler (multi-URL) --------
+# -------- Chat handler (multi-URL con filtro musical) --------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     urls = find_urls(update.message.text if update.message else "")
     if not urls:
         return
     for url in urls:
+        if not is_music_url(url):
+            # enlaces no musicales (Instagram, etc.) -> silencio
+            continue
+
         links, title, artist, cover = await fetch_odesli(url)
         if not links:
             await update.message.reply_text("😕 busqué y busqué pero no encontré.")
@@ -153,7 +172,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(caption, reply_markup=keyboard)
 
-# -------- Inline mode --------
+# -------- Inline mode (también ignora links no musicales) --------
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = (update.inline_query.query or "").strip()
     urls = find_urls(q)
@@ -162,6 +181,10 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     url = urls[0]
+    if not is_music_url(url):
+        await update.inline_query.answer([], cache_time=10, is_personal=True)
+        return
+
     links, title, artist, cover = await fetch_odesli(url)
     if not links:
         await update.inline_query.answer([], cache_time=5, is_personal=True)
