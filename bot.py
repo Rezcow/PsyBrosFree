@@ -1,3 +1,4 @@
+# bot.py
 import os
 import re
 import uuid
@@ -71,7 +72,7 @@ def nice_name(key: str) -> str:
     }
     return mapping.get(k, key.capitalize())
 
-# Favoritos (orden y prioridad)
+# Favoritos (orden)
 FAVS_LOWER = ["spotify", "youtube", "youtubemusic", "applemusic", "soundcloud"]
 
 def sort_keys(links: dict) -> list[str]:
@@ -83,23 +84,31 @@ def sort_keys(links: dict) -> list[str]:
     return fav_present + others_sorted
 
 # ---- Regionalización Apple Music ----
-def _regionalize_apple(url: str) -> str:
-    """Fuerza región Apple Music a COUNTRY y limpia tracking."""
+def _ensure_region_path(path: str) -> str:
+    parts = path.strip("/").split("/", 1)
+    if parts and len(parts[0]) == 2:  # ya trae país
+        parts[0] = COUNTRY.lower()
+        return "/" + "/".join(parts)
+    return f"/{COUNTRY.lower()}/{path.strip('/')}"
+
+def _regionalize_apple(url: str, for_album: bool = False) -> str:
+    """
+    Para TRACK: solo normaliza host y región, conserva query (incluye ?i=).
+    Para ALBUM: normaliza host/región y QUITA la query.
+    """
     try:
         p = urlparse(url)
-        host = p.netloc.lower()
-        if "music.apple.com" in host or "geo.music.apple.com" in host or "itunes.apple.com" in host:
-            host = "music.apple.com"
-            parts = p.path.strip("/").split("/", 1)
-            if parts and len(parts[0]) == 2:
-                parts[0] = COUNTRY.lower()
-                new_path = "/" + "/".join(parts)
-            else:
-                new_path = f"/{COUNTRY.lower()}/{p.path.strip('/')}"
+        host = "music.apple.com"  # unificamos host
+        new_path = _ensure_region_path(p.path)
+        if for_album:
+            # Álbum: sin query
             return urlunparse((p.scheme, host, new_path, "", "", ""))
+        else:
+            # Track: conservar toda la query (para no perder ?i=)
+            return urlunparse((p.scheme, host, new_path, p.params, p.query, p.fragment))
     except Exception as e:
         log.debug(f"No pude regionalizar Apple Music: {e}")
-    return url
+        return url
 
 def normalize_links(raw_links: dict) -> dict:
     """Convierte todas las claves de plataforma a minúsculas."""
@@ -108,15 +117,15 @@ def normalize_links(raw_links: dict) -> dict:
         out[k.lower()] = info
     return out
 
-def regionalize_links(links: dict) -> dict:
-    """Aplica _regionalize_apple y devuelve mismas claves (ya normalizadas)."""
+def regionalize_links_for_track(links: dict) -> dict:
+    """Aplica normalización/región SOLO para links de CANCION (conservando ?i= en Apple)."""
     out = {}
     for k, info in links.items():
         url = info.get("url")
         if not url:
             continue
-        if k.lower() in ("applemusic", "itunes"):
-            url = _regionalize_apple(url)
+        if k in ("applemusic", "itunes"):
+            url = _regionalize_apple(url, for_album=False)  # conserva ?i=
         out[k] = {**info, "url": url}
     return out
 
@@ -130,7 +139,8 @@ ALBUM_LABEL = {
 }
 
 def _album_from_apple(url: str):
-    album_url = _regionalize_apple(url.split("?", 1)[0])
+    # Para álbum quitamos la query
+    album_url = _regionalize_apple(url, for_album=True)
     return album_url, None
 
 async def _album_from_spotify(url: str):
@@ -215,7 +225,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
 
     botones = []
 
-    # 1) CANCION (plataformas favoritas primero)
+    # 1) CANCION (plataformas favoritas primero) -> SIEMPRE TRACK
     fila = []
     for k in keys_to_show:
         url = links[k].get("url")
@@ -230,7 +240,6 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
 
     # 2) ÁLBUM (sección separada)
     if album_buttons:
-        # Encabezado "Álbum" como botón inerte
         botones.append([InlineKeyboardButton("💿 Álbum", callback_data=f"noop|{key}")])
         fila = []
         for text, url in album_buttons:
@@ -262,11 +271,12 @@ async def fetch_odesli(url: str):
         data = r.json()
         raw_links = data.get("linksByPlatform", {}) or {}
         links_norm = normalize_links(raw_links)
-        links = regionalize_links(links_norm)
+        # ⭐️ Para TRACK: regionalizamos sin tocar ?i=
+        links_for_track = regionalize_links_for_track(links_norm)
 
         uid = data.get("entityUniqueId")
         entity = data.get("entitiesByUniqueId", {}).get(uid, {}) if uid else {}
-        return links or None, entity.get("title"), entity.get("artistName"), entity.get("thumbnailUrl")
+        return links_for_track or None, entity.get("title"), entity.get("artistName"), entity.get("thumbnailUrl")
     except Exception as e:
         log.warning(f"Odesli error: {e}")
         return None, None, None, None
@@ -282,9 +292,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         links, title, artist, cover = await fetch_odesli(url)
         if not links:
-            # No respondemos a enlaces no musicales o si no hubo match
+            # No respondemos si no hubo match musical
             continue
 
+        # Derivamos botones de ÁLBUM a partir de los links de TRACK
         album_buttons = await derive_album_buttons_all(links)
         key = remember_links(links, album_buttons)
         keyboard = build_keyboard(links, show_all=False, key=key, album_buttons=album_buttons)
@@ -357,7 +368,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cq.answer()
     data = cq.data or ""
     if data.startswith("noop|"):
-        # botón de encabezado "Álbum": no hace nada
         return
     if not (data.startswith("more|") or data.startswith("less|")):
         return
