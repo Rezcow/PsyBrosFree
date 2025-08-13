@@ -93,32 +93,28 @@ def _ensure_region_path(path: str) -> str:
 
 def _regionalize_apple(url: str, for_album: bool = False) -> str:
     """
-    Para TRACK: solo normaliza host y región, conserva query (incluye ?i=).
-    Para ALBUM: normaliza host/región y QUITA la query.
+    Para TRACK: normaliza host/región y conserva query (?i=).
+    Para ÁLBUM: normaliza host/región y quita query.
     """
     try:
         p = urlparse(url)
-        host = "music.apple.com"  # unificamos host
+        host = "music.apple.com"
         new_path = _ensure_region_path(p.path)
         if for_album:
-            # Álbum: sin query
             return urlunparse((p.scheme, host, new_path, "", "", ""))
         else:
-            # Track: conservar toda la query (para no perder ?i=)
             return urlunparse((p.scheme, host, new_path, p.params, p.query, p.fragment))
     except Exception as e:
         log.debug(f"No pude regionalizar Apple Music: {e}")
         return url
 
 def normalize_links(raw_links: dict) -> dict:
-    """Convierte todas las claves de plataforma a minúsculas."""
     out = {}
     for k, info in raw_links.items():
         out[k.lower()] = info
     return out
 
 def regionalize_links_for_track(links: dict) -> dict:
-    """Aplica normalización/región SOLO para links de CANCION (conservando ?i= en Apple)."""
     out = {}
     for k, info in links.items():
         url = info.get("url")
@@ -130,18 +126,17 @@ def regionalize_links_for_track(links: dict) -> dict:
     return out
 
 # ===== Derivar enlaces de ÁLBUM por plataforma =====
+# 🔽 Etiquetas compactas con emojis para MÓVIL
 ALBUM_LABEL = {
-    "applemusic": "💿 Ver álbum (Manzanita)",
-    "spotify": "💿 Ver álbum (Espotifai)",
-    "youtubemusic": "💿 Ver álbum (Yutúmusic)",
-    "youtube": "💿 Ver álbum (Yutú)",
-    "soundcloud": "💿 Ver álbum (SounClou)",
+    "applemusic": "💿🍎",
+    "spotify": "💿🎧",
+    "youtubemusic": "💿🎵",
+    "youtube": "💿▶️",
+    "soundcloud": "💿☁️",
 }
 
 def _album_from_apple(url: str):
-    # Para álbum quitamos la query
-    album_url = _regionalize_apple(url, for_album=True)
-    return album_url, None
+    return _regionalize_apple(url, for_album=True), None
 
 async def _album_from_spotify(url: str):
     p = urlparse(url)
@@ -169,7 +164,35 @@ def _album_from_yt_like(url: str, prefer_music: bool):
             return f"https://www.youtube.com/playlist?list={lid}", None
     return None, None
 
-def _album_from_soundcloud(url: str):
+async def _ytm_album_from_page(url: str, prefer_music: bool = True):
+    """Scrape: busca playlistId OLAK o browseId MPREb en la página."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, headers=headers, timeout=12)
+        html = r.text
+        m = re.search(r'"playlistId":"(OLAK[^"]+)"', html) or re.search(r'list=(OLAK[^"&]+)', html)
+        if m:
+            pid = m.group(1)
+            if prefer_music:
+                return f"https://music.youtube.com/playlist?list={pid}", None
+            else:
+                return f"https://www.youtube.com/playlist?list={pid}", None
+        m = re.search(r'"browseId":"(MPREb[^"]+)"', html) or re.search(r'/browse/(MPREb[^"?]+)', html)
+        if m:
+            bid = m.group(1)
+            return f"https://music.youtube.com/browse/{bid}", None
+    except Exception as e:
+        log.debug(f"YT scrape fail: {e}")
+    return None, None
+
+async def _album_from_youtube_robust(url: str, prefer_music: bool):
+    album_url, _ = _album_from_yt_like(url, prefer_music)
+    if album_url:
+        return album_url, None
+    return await _ytm_album_from_page(url, prefer_music)
+
+async def _album_from_soundcloud(url: str):
     p = urlparse(url)
     inside = parse_qs(p.query).get("in", [None])[0]
     if inside:
@@ -177,7 +200,7 @@ def _album_from_soundcloud(url: str):
     return None, None
 
 async def derive_album_buttons_all(links: dict):
-    """Devuelve botones de álbum para TODAS las plataformas que se puedan inferir."""
+    """Devuelve botones de álbum para TODAS las plataformas donde se puedan inferir."""
     buttons = []
     seen = set()
     for key in ["applemusic", "spotify", "youtubemusic", "youtube", "soundcloud"]:
@@ -192,11 +215,11 @@ async def derive_album_buttons_all(links: dict):
         elif key == "spotify":
             album_url, _ = await _album_from_spotify(plat_url)
         elif key == "youtubemusic":
-            album_url, _ = _album_from_yt_like(plat_url, prefer_music=True)
+            album_url, _ = await _album_from_youtube_robust(plat_url, prefer_music=True)
         elif key == "youtube":
-            album_url, _ = _album_from_yt_like(plat_url, prefer_music=False)
+            album_url, _ = await _album_from_youtube_robust(plat_url, prefer_music=False)
         elif key == "soundcloud":
-            album_url, _ = _album_from_soundcloud(plat_url)
+            album_url, _ = await _album_from_soundcloud(plat_url)
         else:
             album_url = None
 
@@ -225,7 +248,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
 
     botones = []
 
-    # 1) CANCION (plataformas favoritas primero) -> SIEMPRE TRACK
+    # 1) CANCION (favoritos primero)
     fila = []
     for k in keys_to_show:
         url = links[k].get("url")
@@ -238,13 +261,13 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
     if fila:
         botones.append(fila)
 
-    # 2) ÁLBUM (sección separada)
+    # 2) ÁLBUM (sección separada, etiquetas con emojis)
     if album_buttons:
         botones.append([InlineKeyboardButton("💿 Álbum", callback_data=f"noop|{key}")])
         fila = []
         for text, url in album_buttons:
             fila.append(InlineKeyboardButton(text, url=url))
-            if len(fila) == 2:
+            if len(fila) == 3:
                 botones.append(fila); fila = []
         if fila:
             botones.append(fila)
@@ -271,7 +294,6 @@ async def fetch_odesli(url: str):
         data = r.json()
         raw_links = data.get("linksByPlatform", {}) or {}
         links_norm = normalize_links(raw_links)
-        # ⭐️ Para TRACK: regionalizamos sin tocar ?i=
         links_for_track = regionalize_links_for_track(links_norm)
 
         uid = data.get("entityUniqueId")
@@ -292,10 +314,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         links, title, artist, cover = await fetch_odesli(url)
         if not links:
-            # No respondemos si no hubo match musical
             continue
 
-        # Derivamos botones de ÁLBUM a partir de los links de TRACK
         album_buttons = await derive_album_buttons_all(links)
         key = remember_links(links, album_buttons)
         keyboard = build_keyboard(links, show_all=False, key=key, album_buttons=album_buttons)
@@ -362,7 +382,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         )]
     await update.inline_query.answer(results, cache_time=10, is_personal=True)
 
-# -------- Callbacks (expandir/colapsar y no-op) --------
+# -------- Callbacks --------
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     await cq.answer()
