@@ -45,15 +45,6 @@ def is_music_url(url: str) -> bool:
     except Exception:
         return False
 
-def platform_key_from_url(url: str) -> str | None:
-    host = urlparse(url).netloc.lower()
-    if "spotify" in host: return "spotify"
-    if "music.youtube.com" in host: return "youtubemusic"
-    if "youtube.com" in host or "youtu.be" in host: return "youtube"
-    if "music.apple.com" in host or "geo.music.apple.com" in host or "itunes.apple.com" in host: return "applemusic"
-    if "soundcloud.com" in host: return "soundcloud"
-    return None
-
 def find_urls(text: str) -> list[str]:
     if not text:
         return []
@@ -92,7 +83,7 @@ def sort_keys(links: dict) -> list[str]:
 
 # ---- Regionalización Apple Music ----
 def _regionalize_apple(url: str) -> str:
-    """Fuerza región en enlaces de Apple Music a COUNTRY y limpia tracking."""
+    """Fuerza región Apple Music a COUNTRY y limpia tracking."""
     try:
         p = urlparse(url)
         host = p.netloc.lower()
@@ -104,12 +95,8 @@ def _regionalize_apple(url: str) -> str:
                 new_path = "/" + "/".join(parts)
             else:
                 new_path = f"/{COUNTRY.lower()}/{p.path.strip('/')}"
-            q = parse_qs(p.query)
-            new_q = {}
-            if "i" in q and q["i"]:
-                # Si quieres mantener ?i= para resaltar el track en Apple, comenta la siguiente línea
-                new_q = {}  # <- quitamos ?i= para link del álbum
-            return urlunparse((p.scheme, host, new_path, "", urlencode(new_q) if new_q else "", ""))
+            # quitamos parámetros (p.ej. ?i=...) para que apunte al álbum
+            return urlunparse((p.scheme, host, new_path, "", "", ""))
     except Exception as e:
         log.debug(f"No pude regionalizar Apple Music: {e}")
     return url
@@ -125,87 +112,117 @@ def regionalize_links(links: dict) -> dict:
         out[k] = {**info, "url": url}
     return out
 
-# ----- Álbum desde una URL de track -----
-async def derive_album_button(original_url: str, links: dict):
-    """
-    Intenta obtener (btn_text, album_url, album_name_optional) desde la plataforma del link original.
-    Devuelve None si no se puede inferir.
-    """
-    key = platform_key_from_url(original_url)
-    if not key or key not in links:
-        return None
-    platform_url = links[key].get("url")
-    if not platform_url:
-        return None
+# ===== Derivar enlaces de ÁLBUM por plataforma =====
+ALBUM_LABEL = {
+    "applemusic": "💿 Ver álbum (Manzanita)",
+    "spotify": "💿 Ver álbum (Espotifai)",
+    "youtubemusic": "💿 Ver álbum (Yutúmusic)",
+    "youtube": "💿 Ver álbum (Yutú)",
+    "soundcloud": "💿 Ver álbum (SounClou)",
+}
 
-    # Apple Music: quitar query (?i=...) y forzar región
-    if key == "applemusic":
-        album_url = _regionalize_apple(platform_url.split("?", 1)[0])
-        album_name = None
-        try:
-            m = re.search(r"/album/([^/]+)/", urlparse(album_url).path)
-            if m:
-                album_name = m.group(1).replace("-", " ").strip().title()
-        except Exception:
-            pass
-        return ("💿 Ver álbum (Manzanita)", album_url, album_name)
+def _album_from_apple(url: str):
+    album_url = _regionalize_apple(url.split("?", 1)[0])
+    album_name = None
+    try:
+        m = re.search(r"/album/([^/]+)/", urlparse(album_url).path)
+        if m:
+            album_name = m.group(1).replace("-", " ").strip().title()
+    except Exception:
+        pass
+    return album_url, album_name
 
-    # Spotify: extraer album desde el HTML del track
-    if key == "spotify":
-        try:
-            headers = {"User-Agent": "Mozilla/5.0"}
-            async with httpx.AsyncClient() as client:
-                r = await client.get(platform_url, headers=headers, timeout=10)
-            m = re.search(r"open\.spotify\.com/album/([A-Za-z0-9]+)", r.text)
-            if m:
-                album_url = f"https://open.spotify.com/album/{m.group(1)}"
-                return ("💿 Ver álbum (Espotifai)", album_url, None)
-        except Exception as e:
-            log.debug(f"Spotify album fetch fail: {e}")
+async def _album_from_spotify(url: str):
+    p = urlparse(url)
+    if "/album/" in p.path:
+        return url, None
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, headers=headers, timeout=10)
+        m = re.search(r"open\.spotify\.com/album/([A-Za-z0-9]+)", r.text)
+        if m:
+            return f"https://open.spotify.com/album/{m.group(1)}", None
+    except Exception as e:
+        log.debug(f"Spotify album fetch fail: {e}")
+    return None, None
 
-    # YouTube / YouTube Music: si hay list=OLAK... lo usamos
-    if key in ("youtubemusic", "youtube"):
-        p = urlparse(platform_url)
-        qs = parse_qs(p.query)
-        lid = qs.get("list", [None])[0]
-        if lid and lid.startswith("OLAK"):
-            album_url = f"https://music.youtube.com/playlist?list={lid}"
-            return ("💿 Ver álbum (Yutúmusic)", album_url, None)
+def _album_from_yt_like(url: str, prefer_music: bool):
+    p = urlparse(url)
+    qs = parse_qs(p.query)
+    lid = qs.get("list", [None])[0]
+    if lid and lid.startswith("OLAK"):
+        if prefer_music:
+            return f"https://music.youtube.com/playlist?list={lid}", None
+        else:
+            return f"https://www.youtube.com/playlist?list={lid}", None
+    return None, None
 
-    # SoundCloud: parámetro ?in=user/sets/...
-    if key == "soundcloud":
-        p = urlparse(platform_url)
-        inside = parse_qs(p.query).get("in", [None])[0]
-        if inside:
-            album_url = f"https://soundcloud.com/{inside}"
-            return ("💿 Ver álbum (SounClou)", album_url, None)
+def _album_from_soundcloud(url: str):
+    p = urlparse(url)
+    inside = parse_qs(p.query).get("in", [None])[0]
+    if inside:
+        return f"https://soundcloud.com/{inside}", None
+    return None, None
 
-    return None
+async def derive_album_buttons_all(links: dict):
+    """Devuelve lista de botones de álbum [(texto, url)] para TODAS las plataformas que se puedan inferir."""
+    buttons = []
+    seen = set()
+    for key in ["applemusic", "spotify", "youtubemusic", "youtube", "soundcloud"]:
+        if key not in links:
+            continue
+        plat_url = links[key].get("url")
+        if not plat_url:
+            continue
 
-# almacenamiento simple para callbacks
+        if key == "applemusic":
+            album_url, _ = _album_from_apple(plat_url)
+        elif key == "spotify":
+            album_url, _ = await _album_from_spotify(plat_url)
+        elif key == "youtubemusic":
+            album_url, _ = _album_from_yt_like(plat_url, prefer_music=True)
+        elif key == "youtube":
+            album_url, _ = _album_from_yt_like(plat_url, prefer_music=False)
+        elif key == "soundcloud":
+            album_url, _ = _album_from_soundcloud(plat_url)
+        else:
+            album_url = None
+
+        if album_url and album_url not in seen:
+            seen.add(album_url)
+            buttons.append((ALBUM_LABEL[key], album_url))
+    return buttons
+
+# almacenamiento para callbacks
 STORE: dict[str, dict] = {}
 ORDER = deque(maxlen=300)
-def remember_links(links: dict, album: tuple[str, str] | None) -> str:
+def remember_links(links: dict, album_buttons: list[tuple[str, str]]) -> str:
     key = uuid.uuid4().hex
-    STORE[key] = {"links": links, "album": album}
+    STORE[key] = {"links": links, "albums": album_buttons}
     ORDER.append(key)
     while len(STORE) > ORDER.maxlen:
         old = ORDER.popleft()
         STORE.pop(old, None)
     return key
 
-def build_keyboard(links: dict, show_all: bool, key: str, album_button: tuple[str, str] | None) -> InlineKeyboardMarkup:
+def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     sorted_keys = sort_keys(links)
     keys_to_show = sorted_keys if show_all else [k for k in sorted_keys if k.lower() in set(FAVS_LOWER)]
 
     botones = []
 
-    # Fila de "Ver álbum" (si disponible)
-    if album_button:
-        btn_text, btn_url = album_button
-        botones.append([InlineKeyboardButton(btn_text, url=btn_url)])
+    # Filas de álbum: de 2 en 2 para que se lean bien
+    if album_buttons:
+        fila = []
+        for text, url in album_buttons:
+            fila.append(InlineKeyboardButton(text, url=url))
+            if len(fila) == 2:
+                botones.append(fila); fila = []
+        if fila:
+            botones.append(fila)
 
-    # Plataformas
+    # Plataformas (3 por fila)
     fila = []
     for k in keys_to_show:
         url = links[k].get("url")
@@ -260,26 +277,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("😕 busqué y busqué pero no encontré.")
             continue
 
-        # botón "Ver álbum" + posible nombre
-        album_info = await derive_album_button(url, links)
-        album_button = None
-        album_caption = None
-        if album_info:
-            btn_text, album_url, album_name = album_info
-            album_button = (btn_text, album_url)
-            if album_name:
-                album_caption = album_name
-
-        key = remember_links(links, album_button)
-        keyboard = build_keyboard(links, show_all=False, key=key, album_button=album_button)
+        album_buttons = await derive_album_buttons_all(links)
+        key = remember_links(links, album_buttons)
+        keyboard = build_keyboard(links, show_all=False, key=key, album_buttons=album_buttons)
 
         caption = "🎶 Disponible en:"
         if title and artist:
             caption = f"🎵 {title} — {artist}\n🎶 Disponible en:"
         elif title:
             caption = f"🎵 {title}\n🎶 Disponible en:"
-        if album_caption:
-            caption += f"\n💿 Álbum: {album_caption}"
 
         if cover:
             try:
@@ -313,25 +319,15 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.inline_query.answer([], cache_time=5, is_personal=True)
         return
 
-    album_info = await derive_album_button(url, links)
-    album_button = None
-    album_caption = None
-    if album_info:
-        btn_text, album_url, album_name = album_info
-        album_button = (btn_text, album_url)
-        if album_name:
-            album_caption = album_name
-
-    key = remember_links(links, album_button)
-    keyboard = build_keyboard(links, show_all=False, key=key, album_button=album_button)
+    album_buttons = await derive_album_buttons_all(links)
+    key = remember_links(links, album_buttons)
+    keyboard = build_keyboard(links, show_all=False, key=key, album_buttons=album_buttons)
 
     caption = "🎶 Disponible en:"
     if title and artist:
         caption = f"🎵 {title} — {artist}\n🎶 Disponible en:"
     elif title:
         caption = f"🎵 {title}\n🎶 Disponible en:"
-    if album_caption:
-        caption += f"\n💿 Álbum: {album_caption}"
 
     rid = str(uuid.uuid4())
     if cover:
@@ -360,9 +356,9 @@ async def toggle_more_less(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     links = entry["links"]
-    album_button = entry.get("album")
+    album_buttons = entry.get("albums", [])
     show_all = data.startswith("more|")
-    keyboard = build_keyboard(links, show_all=show_all, key=key, album_button=album_button)
+    keyboard = build_keyboard(links, show_all=show_all, key=key, album_buttons=album_buttons)
 
     try:
         if cq.inline_message_id:
