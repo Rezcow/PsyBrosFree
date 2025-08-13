@@ -4,7 +4,7 @@ import uuid
 import logging
 import httpx
 from collections import deque
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+from urllib.parse import urlparse, urlunparse, parse_qs
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -20,10 +20,10 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("odesli-bot-plus")
+log = logging.getLogger("odesli-bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-COUNTRY = os.environ.get("ODESLI_COUNTRY", "CL").upper()  # región por defecto
+COUNTRY = os.environ.get("ODESLI_COUNTRY", "CL").upper()  # región preferida
 
 # -------- Utils --------
 URL_RE = re.compile(r"https?://\S+")
@@ -71,6 +71,7 @@ def nice_name(key: str) -> str:
     }
     return mapping.get(k, key.capitalize())
 
+# Favoritos (orden y prioridad)
 FAVS_LOWER = ["spotify", "youtube", "youtubemusic", "applemusic", "soundcloud"]
 
 def sort_keys(links: dict) -> list[str]:
@@ -95,13 +96,20 @@ def _regionalize_apple(url: str) -> str:
                 new_path = "/" + "/".join(parts)
             else:
                 new_path = f"/{COUNTRY.lower()}/{p.path.strip('/')}"
-            # quitamos parámetros (p.ej. ?i=...) para que apunte al álbum
             return urlunparse((p.scheme, host, new_path, "", "", ""))
     except Exception as e:
         log.debug(f"No pude regionalizar Apple Music: {e}")
     return url
 
+def normalize_links(raw_links: dict) -> dict:
+    """Convierte todas las claves de plataforma a minúsculas."""
+    out = {}
+    for k, info in raw_links.items():
+        out[k.lower()] = info
+    return out
+
 def regionalize_links(links: dict) -> dict:
+    """Aplica _regionalize_apple y devuelve mismas claves (ya normalizadas)."""
     out = {}
     for k, info in links.items():
         url = info.get("url")
@@ -123,14 +131,7 @@ ALBUM_LABEL = {
 
 def _album_from_apple(url: str):
     album_url = _regionalize_apple(url.split("?", 1)[0])
-    album_name = None
-    try:
-        m = re.search(r"/album/([^/]+)/", urlparse(album_url).path)
-        if m:
-            album_name = m.group(1).replace("-", " ").strip().title()
-    except Exception:
-        pass
-    return album_url, album_name
+    return album_url, None
 
 async def _album_from_spotify(url: str):
     p = urlparse(url)
@@ -166,7 +167,7 @@ def _album_from_soundcloud(url: str):
     return None, None
 
 async def derive_album_buttons_all(links: dict):
-    """Devuelve lista de botones de álbum [(texto, url)] para TODAS las plataformas que se puedan inferir."""
+    """Devuelve botones de álbum para TODAS las plataformas que se puedan inferir."""
     buttons = []
     seen = set()
     for key in ["applemusic", "spotify", "youtubemusic", "youtube", "soundcloud"]:
@@ -194,9 +195,10 @@ async def derive_album_buttons_all(links: dict):
             buttons.append((ALBUM_LABEL[key], album_url))
     return buttons
 
-# almacenamiento para callbacks
+# ===== Teclado =====
 STORE: dict[str, dict] = {}
 ORDER = deque(maxlen=300)
+
 def remember_links(links: dict, album_buttons: list[tuple[str, str]]) -> str:
     key = uuid.uuid4().hex
     STORE[key] = {"links": links, "albums": album_buttons}
@@ -208,21 +210,12 @@ def remember_links(links: dict, album_buttons: list[tuple[str, str]]) -> str:
 
 def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     sorted_keys = sort_keys(links)
-    keys_to_show = sorted_keys if show_all else [k for k in sorted_keys if k.lower() in set(FAVS_LOWER)]
+    fav_set = set(FAVS_LOWER)
+    keys_to_show = sorted_keys if show_all else [k for k in sorted_keys if k.lower() in fav_set]
 
     botones = []
 
-    # Filas de álbum: de 2 en 2 para que se lean bien
-    if album_buttons:
-        fila = []
-        for text, url in album_buttons:
-            fila.append(InlineKeyboardButton(text, url=url))
-            if len(fila) == 2:
-                botones.append(fila); fila = []
-        if fila:
-            botones.append(fila)
-
-    # Plataformas (3 por fila)
+    # 1) CANCION (plataformas favoritas primero)
     fila = []
     for k in keys_to_show:
         url = links[k].get("url")
@@ -235,7 +228,19 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
     if fila:
         botones.append(fila)
 
-    # Expandir/colapsar
+    # 2) ÁLBUM (sección separada)
+    if album_buttons:
+        # Encabezado "Álbum" como botón inerte
+        botones.append([InlineKeyboardButton("💿 Álbum", callback_data=f"noop|{key}")])
+        fila = []
+        for text, url in album_buttons:
+            fila.append(InlineKeyboardButton(text, url=url))
+            if len(fila) == 2:
+                botones.append(fila); fila = []
+        if fila:
+            botones.append(fila)
+
+    # 3) Expandir/colapsar plataformas de la CANCIÓN
     if not show_all and len(keys_to_show) < len(sorted_keys):
         botones.append([InlineKeyboardButton("Más opciones ▾", callback_data=f"more|{key}")])
     elif show_all:
@@ -243,6 +248,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
 
     return InlineKeyboardMarkup(botones)
 
+# ===== Odesli =====
 async def fetch_odesli(url: str):
     """Devuelve (links_by_platform, title, artist, cover_url)."""
     api = "https://api.song.link/v1-alpha.1/links"
@@ -255,7 +261,9 @@ async def fetch_odesli(url: str):
             return None, None, None, None
         data = r.json()
         raw_links = data.get("linksByPlatform", {}) or {}
-        links = regionalize_links(raw_links)
+        links_norm = normalize_links(raw_links)
+        links = regionalize_links(links_norm)
+
         uid = data.get("entityUniqueId")
         entity = data.get("entitiesByUniqueId", {}).get(uid, {}) if uid else {}
         return links or None, entity.get("title"), entity.get("artistName"), entity.get("thumbnailUrl")
@@ -274,7 +282,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         links, title, artist, cover = await fetch_odesli(url)
         if not links:
-            await update.message.reply_text("😕 busqué y busqué pero no encontré.")
+            # No respondemos a enlaces no musicales o si no hubo match
             continue
 
         album_buttons = await derive_album_buttons_all(links)
@@ -343,11 +351,14 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         )]
     await update.inline_query.answer(results, cache_time=10, is_personal=True)
 
-# -------- Callbacks (expandir/colapsar) --------
-async def toggle_more_less(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# -------- Callbacks (expandir/colapsar y no-op) --------
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     await cq.answer()
     data = cq.data or ""
+    if data.startswith("noop|"):
+        # botón de encabezado "Álbum": no hace nada
+        return
     if not (data.startswith("more|") or data.startswith("less|")):
         return
     _, key = data.split("|", 1)
@@ -387,6 +398,6 @@ if __name__ == "__main__":
     app = (Application.builder().token(BOT_TOKEN).post_init(_post_init).build())
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(InlineQueryHandler(handle_inline_query))
-    app.add_handler(CallbackQueryHandler(toggle_more_less))
+    app.add_handler(CallbackQueryHandler(callbacks))
     log.info("✅ Bot listo. Escribe o usa @Bot en cualquier chat.")
     app.run_polling(drop_pending_updates=True)
