@@ -1,4 +1,3 @@
-# bot.py
 import os
 import re
 import uuid
@@ -25,6 +24,14 @@ log = logging.getLogger("odesli-bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 COUNTRY = os.environ.get("ODESLI_COUNTRY", "CL").upper()  # región preferida
+WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
+PORT = int(os.environ.get("PORT", "8000"))
+BASE_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("APP_BASE_URL")
+if not BASE_URL:
+    raise RuntimeError(
+        "No encuentro BASE_URL. Render suele exponer RENDER_EXTERNAL_URL automáticamente. "
+        "Si no aparece, define APP_BASE_URL = https://<tu-servicio>.onrender.com"
+    )
 
 # -------- Utils --------
 URL_RE = re.compile(r"https?://\S+")
@@ -418,20 +425,18 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning(f"No pude editar el teclado: {e}")
 
-# -------- Post-init / main --------
-async def _post_init(app: Application):
-    # Asegura que no quede ningún webhook previo activo
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Webhook eliminado; inline + polling listos.")
-    except Exception as e:
-        log.warning(f"No pude limpiar webhook: {e}")
-
+# -------- main (WEBHOOK) --------
 if __name__ == "__main__":
-    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(InlineQueryHandler(handle_inline_query))
     app.add_handler(CallbackQueryHandler(callbacks))
 
-    log.info("✅ Iniciando en modo POLLING…")
-    app.run_polling(drop_pending_updates=True)
+    log.info("🚀 Iniciando en modo WEBHOOK")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        secret_token=WEBHOOK_SECRET,
+        webhook_url=f"{BASE_URL.rstrip('/')}/{WEBHOOK_SECRET}",
+        drop_pending_updates=True,
+    )

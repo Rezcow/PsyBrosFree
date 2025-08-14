@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: psybros-bot
+    env: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      # Si quieres forzarlo manualmente:
+      # - key: APP_BASE_URL
+      #   value: https://tu-servicio.onrender.com
