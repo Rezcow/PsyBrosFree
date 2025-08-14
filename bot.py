@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # bot.py
 import os
 import re
@@ -431,3 +432,249 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(callbacks))
     log.info("✅ Bot listo. Escribe o usa @Bot en cualquier chat.")
     app.run_polling(drop_pending_updates=True)
+=======
+import os
+import re
+from typing import Dict, Tuple
+
+import httpx
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, MessageHandler, ContextTypes, filters
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+DEFAULT_COUNTRY = os.environ.get("ODESLI_COUNTRY", "CL")
+# Render Web Service suele exponer esta URL pública:
+BASE_URL = os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "secret")
+PORT = int(os.environ.get("PORT", "10000"))
+
+# Dominios soportados (el bot ignora el resto)
+SUPPORTED_DOMAINS = (
+    "spotify.com",
+    "music.apple.com",
+    "youtube.com",
+    "youtu.be",
+    "music.youtube.com",
+    "soundcloud.com",
+)
+
+# Nombres “cortos” para TRACKS
+FRIENDLY_NAMES = {
+    "spotify": "Espotifai",
+    "youtube": "Yutú",
+    "youtubemusic": "Yutúmusic",
+    "applemusic": "Manzanita",
+    "itunes": "Manzanita",
+    "soundcloud": "SounClou",
+}
+# Orden de prioridad para la fila principal de TRACKS
+TRACK_PRIORITY = ["spotify", "youtube", "youtubemusic", "applemusic", "soundcloud"]
+
+# Etiquetas compactas para ÁLBUM (emojis)
+ALBUM_EMOJI = {
+    "spotify": "💿🟢",
+    "applemusic": "💿🍎",
+    "itunes": "💿🍎",
+    "youtube": "💿▶️",
+    "youtubemusic": "💿🎵",
+    "soundcloud": "💿☁️",
+}
+ALBUM_PRIORITY = ["spotify", "applemusic", "youtube", "youtubemusic", "soundcloud"]
+
+
+def _norm_platform(p: str) -> str:
+    """Normaliza la clave de plataforma devuelta por Odesli."""
+    p = (p or "").strip().lower()
+    # unificar variantes comunes
+    if p in ("itunes", "apple", "apple music"):
+        return "applemusic"
+    if p in ("youtubemusic", "youtube music", "youtube_music"):
+        return "youtubemusic"
+    if p == "soundcloud":
+        return "soundcloud"
+    if p == "spotify":
+        return "spotify"
+    if p == "youtube":
+        return "youtube"
+    return p
+
+
+def _is_supported_url(text: str) -> Tuple[bool, str]:
+    m = re.search(r"https?://\S+", text or "")
+    if not m:
+        return False, ""
+    url = m.group(0)
+    if not any(d in url for d in SUPPORTED_DOMAINS):
+        return False, ""
+    return True, url
+
+
+async def _call_odesli(url: str, country: str) -> Dict:
+    api = f"https://api.song.link/v1-alpha.1/links?url={url}&userCountry={country}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(api)
+        r.raise_for_status()
+        return r.json()
+
+
+def _split_track_and_album_links(data: Dict) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Separa links por plataforma en:
+      - tracks: {platform: url}
+      - albums: {platform: url}
+    Basado en el tipo de entidad (song/album) de Odesli.
+    """
+    links_by_platform = data.get("linksByPlatform", {}) or {}
+    entities = data.get("entitiesByUniqueId", {}) or {}
+
+    track_links: Dict[str, str] = {}
+    album_links: Dict[str, str] = {}
+
+    for plat_key, info in links_by_platform.items():
+        url = (info or {}).get("url")
+        ent_id = (info or {}).get("entityUniqueId")
+        ent = entities.get(ent_id, {}) if ent_id else {}
+        ent_type = (ent.get("type") or "").lower()
+
+        plat = _norm_platform(plat_key)
+        if not url:
+            continue
+
+        if "album" in ent_type:
+            album_links[plat] = url
+        else:
+            # por defecto tratamos como track
+            track_links[plat] = url
+
+    return track_links, album_links
+
+
+def _extract_title_artist_thumb(data: Dict) -> Tuple[str, str, str]:
+    entities = data.get("entitiesByUniqueId", {}) or {}
+    uid = data.get("entityUniqueId")
+    ent = entities.get(uid, {}) if uid else {}
+
+    title = ent.get("title") or ""
+    artist = ent.get("artistName") or ""
+    thumb = ent.get("thumbnailUrl") or ent.get("imageUrl") or ""
+
+    return title, artist, thumb
+
+
+def _ordered_items(d: Dict[str, str], priority: list) -> list:
+    # primero los de la prioridad, luego el resto en orden alfabético
+    first = [k for k in priority if k in d]
+    rest = sorted([k for k in d.keys() if k not in first])
+    return first + rest
+
+
+def _track_label(plat: str) -> str:
+    return FRIENDLY_NAMES.get(plat, plat.capitalize())
+
+
+def _album_label(plat: str) -> str:
+    return ALBUM_EMOJI.get(plat, "💿")
+
+
+def _build_keyboard(data: Dict) -> InlineKeyboardMarkup:
+    page_url = data.get("pageUrl") or data.get("url") or None
+    tracks, albums = _split_track_and_album_links(data)
+
+    rows = []
+
+    # ========== Fila(s) principales: TRACKS ==========
+    if tracks:
+        ordered = _ordered_items(tracks, TRACK_PRIORITY)
+        # 3 columnas por fila
+        row = []
+        for plat in ordered:
+            row.append(InlineKeyboardButton(_track_label(plat), url=tracks[plat]))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+
+    # ========== ÁLBUM (si hay) ==========
+    if albums:
+        rows.append([InlineKeyboardButton("Álbum", callback_data="noop")])  # título seccion
+        ordered_a = _ordered_items(albums, ALBUM_PRIORITY)
+        row = []
+        for plat in ordered_a:
+            row.append(InlineKeyboardButton(_album_label(plat), url=albums[plat]))
+            if len(row) == 4:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+
+    # ========== Más opciones (abre Song.link) ==========
+    if page_url:
+        rows.append([InlineKeyboardButton("Más opciones ▾", url=page_url)])
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+
+    ok, url = _is_supported_url(update.message.text)
+    if not ok:
+        # Silencioso para links no soportados
+        return
+
+    # Resolver con Odesli
+    try:
+        data = await _call_odesli(url, DEFAULT_COUNTRY)
+    except Exception as e:
+        # Silencioso (o si prefieres, envía un texto de error)
+        # await update.message.reply_text("No pude resolver ese enlace ahora mismo.")
+        return
+
+    title, artist, thumb = _extract_title_artist_thumb(data)
+    caption_lines = []
+    if title or artist:
+        if artist:
+            caption_lines.append(f"{title} — {artist}")
+        else:
+            caption_lines.append(title)
+    caption_lines.append("Disponible en:")
+    caption = "🎵 " + "\n".join(caption_lines)
+
+    kb = _build_keyboard(data)
+
+    try:
+        if thumb:
+            await update.message.reply_photo(photo=thumb, caption=caption, reply_markup=kb)
+        else:
+            await update.message.reply_text(text=caption, reply_markup=kb)
+    except Exception:
+        # fallback a mensaje simple si falla la imagen
+        await update.message.reply_text(text=caption, reply_markup=kb)
+
+
+def build_app() -> Application:
+    return Application.builder().token(BOT_TOKEN).build()
+
+
+if __name__ == "__main__":
+    app = build_app()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+
+    # --- Webhook en Render Free (Web Service) ---
+    if BASE_URL:
+        BASE_URL = BASE_URL.rstrip("/")
+        path = f"/webhook/{BOT_TOKEN}"
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=path,
+            webhook_url=f"{BASE_URL}{path}",
+            secret_token=WEBHOOK_SECRET,
+            drop_pending_updates=True,
+        )
+    else:
+        # Para correr localmente:
+        app.run_polling(drop_pending_updates=True)
+>>>>>>> 965000f (setup: archivos del bot)
