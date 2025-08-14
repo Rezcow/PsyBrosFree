@@ -3,17 +3,17 @@ import os
 import re
 import uuid
 import logging
-import httpx
 from collections import deque
 from urllib.parse import urlparse, urlunparse, parse_qs
 
+import httpx
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InlineQueryResultArticle, InlineQueryResultPhoto, InputTextMessageContent
+    InlineQueryResultArticle, InlineQueryResultPhoto, InputTextMessageContent,
 )
 from telegram.ext import (
     Application, MessageHandler, ContextTypes, filters,
-    InlineQueryHandler, CallbackQueryHandler
+    InlineQueryHandler, CallbackQueryHandler,
 )
 
 # -------- Config / Logging --------
@@ -25,11 +25,6 @@ log = logging.getLogger("odesli-bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 COUNTRY = os.environ.get("ODESLI_COUNTRY", "CL").upper()  # región preferida
-
-# Soporte Render (webhook) o fallback a polling
-BASE_URL = os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "secret")
-PORT = int(os.environ.get("PORT", "10000"))
 
 # -------- Utils --------
 URL_RE = re.compile(r"https?://\S+")
@@ -58,7 +53,8 @@ def find_urls(text: str) -> list[str]:
     seen, out = set(), []
     for u in urls:
         if u not in seen:
-            seen.add(u); out.append(u)
+            seen.add(u)
+            out.append(u)
     return out
 
 def nice_name(key: str) -> str:
@@ -140,9 +136,6 @@ ALBUM_LABEL = {
     "soundcloud": "💿☁️",
 }
 
-def _album_from_apple(url: str):
-    return _regionalize_apple(url, for_album=True), None
-
 async def _album_from_spotify(url: str):
     p = urlparse(url)
     if "/album/" in p.path:
@@ -157,6 +150,9 @@ async def _album_from_spotify(url: str):
     except Exception as e:
         log.debug(f"Spotify album fetch fail: {e}")
     return None, None
+
+def _album_from_apple(url: str):
+    return _regionalize_apple(url, for_album=True), None
 
 def _album_from_yt_like(url: str, prefer_music: bool):
     p = urlparse(url)
@@ -230,7 +226,8 @@ async def derive_album_buttons_all(links: dict):
 
         if album_url and album_url not in seen:
             seen.add(album_url)
-            buttons.append((ALBUM_LABEL[key], album_url))
+            label = ALBUM_LABEL.get(key, "💿")
+            buttons.append((label, album_url))
     return buttons
 
 # ===== Teclado =====
@@ -423,6 +420,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------- Post-init / main --------
 async def _post_init(app: Application):
+    # Asegura que no quede ningún webhook previo activo
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
         log.info("Webhook eliminado; inline + polling listos.")
@@ -430,25 +428,10 @@ async def _post_init(app: Application):
         log.warning(f"No pude limpiar webhook: {e}")
 
 if __name__ == "__main__":
-    app = (Application.builder().token(BOT_TOKEN).post_init(_post_init).build())
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(InlineQueryHandler(handle_inline_query))
     app.add_handler(CallbackQueryHandler(callbacks))
 
-    log.info("✅ Bot listo.")
-
-    if BASE_URL:
-        # Render Web Service (webhook)
-        base = BASE_URL.rstrip("/")
-        path = f"/webhook/{WEBHOOK_SECRET}"
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=path,
-            webhook_url=f"{base}{path}",
-            secret_token=WEBHOOK_SECRET,
-            drop_pending_updates=True,
-        )
-    else:
-        # Local / sin URL pública
-        app.run_polling(drop_pending_updates=True)
+    log.info("✅ Iniciando en modo POLLING…")
+    app.run_polling(drop_pending_updates=True)
