@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+downloads/
+.cache/
+.env
+.DS_Store
+.vscode/
+Procfile
+railway.json
