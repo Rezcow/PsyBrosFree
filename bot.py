@@ -1,3 +1,4 @@
+# bot.py
 import os
 import re
 import uuid
@@ -12,7 +13,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, MessageHandler, ContextTypes, filters,
-    InlineQueryHandler, CallbackQueryHandler,
+    InlineQueryHandler, CallbackQueryHandler, CommandHandler,
 )
 
 # -------- Config / Logging --------
@@ -21,17 +22,13 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("odesli-bot")
+logging.getLogger("aiohttp.access").setLevel(logging.INFO)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-COUNTRY = os.environ.get("ODESLI_COUNTRY", "CL").upper()  # región preferida
+COUNTRY = os.environ.get("ODESLI_COUNTRY", "CL").upper()
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
-PORT = int(os.environ.get("PORT", "8000"))
-BASE_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("APP_BASE_URL")
-if not BASE_URL:
-    raise RuntimeError(
-        "No encuentro BASE_URL. Render suele exponer RENDER_EXTERNAL_URL automáticamente. "
-        "Si no aparece, define APP_BASE_URL = https://<tu-servicio>.onrender.com"
-    )
+PORT = int(os.environ.get("PORT", "10000"))
+PUBLIC_URL = os.environ.get("PUBLIC_URL")  # opcional: si no lo pasas usamos el onrender.com detectado
 
 # -------- Utils --------
 URL_RE = re.compile(r"https?://\S+")
@@ -80,7 +77,6 @@ def nice_name(key: str) -> str:
     }
     return mapping.get(k, key.capitalize())
 
-# Favoritos (orden)
 FAVS_LOWER = ["spotify", "youtube", "youtubemusic", "applemusic", "soundcloud"]
 
 def sort_keys(links: dict) -> list[str]:
@@ -94,16 +90,12 @@ def sort_keys(links: dict) -> list[str]:
 # ---- Regionalización Apple Music ----
 def _ensure_region_path(path: str) -> str:
     parts = path.strip("/").split("/", 1)
-    if parts and len(parts[0]) == 2:  # ya trae país
+    if parts and len(parts[0]) == 2:
         parts[0] = COUNTRY.lower()
         return "/" + "/".join(parts)
     return f"/{COUNTRY.lower()}/{path.strip('/')}"
 
 def _regionalize_apple(url: str, for_album: bool = False) -> str:
-    """
-    Para TRACK: normaliza host/región y conserva query (?i=).
-    Para ÁLBUM: normaliza host/región y quita query.
-    """
     try:
         p = urlparse(url)
         host = "music.apple.com"
@@ -129,12 +121,11 @@ def regionalize_links_for_track(links: dict) -> dict:
         if not url:
             continue
         if k in ("applemusic", "itunes"):
-            url = _regionalize_apple(url, for_album=False)  # conserva ?i=
+            url = _regionalize_apple(url, for_album=False)
         out[k] = {**info, "url": url}
     return out
 
 # ===== Derivar enlaces de ÁLBUM por plataforma =====
-# 🔽 Etiquetas compactas con emojis para MÓVIL
 ALBUM_LABEL = {
     "applemusic": "💿🍎",
     "spotify": "💿🎧",
@@ -173,7 +164,6 @@ def _album_from_yt_like(url: str, prefer_music: bool):
     return None, None
 
 async def _ytm_album_from_page(url: str, prefer_music: bool = True):
-    """Scrape: busca playlistId OLAK o browseId MPREb en la página."""
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         async with httpx.AsyncClient() as client:
@@ -208,7 +198,6 @@ async def _album_from_soundcloud(url: str):
     return None, None
 
 async def derive_album_buttons_all(links: dict):
-    """Devuelve botones de álbum para TODAS las plataformas donde se puedan inferir."""
     buttons = []
     seen = set()
     for key in ["applemusic", "spotify", "youtubemusic", "youtube", "soundcloud"]:
@@ -237,7 +226,7 @@ async def derive_album_buttons_all(links: dict):
             buttons.append((label, album_url))
     return buttons
 
-# ===== Teclado =====
+# ===== Teclado / memoria =====
 STORE: dict[str, dict] = {}
 ORDER = deque(maxlen=300)
 
@@ -257,7 +246,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
 
     botones = []
 
-    # 1) CANCION (favoritos primero)
+    # 1) CANCION
     fila = []
     for k in keys_to_show:
         url = links[k].get("url")
@@ -270,7 +259,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
     if fila:
         botones.append(fila)
 
-    # 2) ÁLBUM (sección separada, etiquetas con emojis)
+    # 2) ÁLBUM
     if album_buttons:
         botones.append([InlineKeyboardButton("💿 Álbum", callback_data=f"noop|{key}")])
         fila = []
@@ -281,7 +270,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
         if fila:
             botones.append(fila)
 
-    # 3) Expandir/colapsar plataformas de la CANCIÓN
+    # 3) Expandir/colapsar
     if not show_all and len(keys_to_show) < len(sorted_keys):
         botones.append([InlineKeyboardButton("Más opciones ▾", callback_data=f"more|{key}")])
     elif show_all:
@@ -291,7 +280,6 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
 
 # ===== Odesli =====
 async def fetch_odesli(url: str):
-    """Devuelve (links_by_platform, title, artist, cover_url)."""
     api = "https://api.song.link/v1-alpha.1/links"
     params = {"url": url, "userCountry": COUNTRY}
     headers = {"Accept-Language": f"es-{COUNTRY},es;q=0.9,en;q=0.8"}
@@ -312,9 +300,10 @@ async def fetch_odesli(url: str):
         log.warning(f"Odesli error: {e}")
         return None, None, None, None
 
-# -------- Chat handler --------
+# -------- Handlers --------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    urls = find_urls(update.message.text if update.message else "")
+    text = update.message.text if update.message else ""
+    urls = find_urls(text)
     if not urls:
         return
     for url in urls:
@@ -343,13 +332,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=caption,
                     reply_markup=keyboard
                 )
-                continue
+                return
             except Exception as e:
                 log.info(f"No pude usar la portada, envío texto. {e}")
 
         await update.message.reply_text(caption, reply_markup=keyboard)
 
-# -------- Inline mode --------
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = (update.inline_query.query or "").strip()
     urls = find_urls(q)
@@ -391,7 +379,6 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         )]
     await update.inline_query.answer(results, cache_time=10, is_personal=True)
 
-# -------- Callbacks --------
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     await cq.answer()
@@ -425,18 +412,47 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning(f"No pude editar el teclado: {e}")
 
-# -------- main (WEBHOOK) --------
+# --- Handlers de prueba/diagnóstico ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Estoy vivo. Envíame un link de Spotify/YouTube/Apple Music.")
+
+async def tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # último por si algo no coincidió con otros handlers
+    log.info("Recibí un update que no coincidió con filtros: %s", update.to_dict())
+
+# -------- Post-init / main --------
+async def _post_init(app: Application):
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook previo eliminado.")
+    except Exception as e:
+        log.warning(f"No pude limpiar webhook: {e}")
+
 if __name__ == "__main__":
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
+
+    # Handlers
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(InlineQueryHandler(handle_inline_query))
     app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(MessageHandler(filters.ALL, tap))  # al final
 
-    log.info("🚀 Iniciando en modo WEBHOOK")
+    # --- Webhook ---
+    # Si no pones PUBLIC_URL como env var, Render te publica en https://<tu-servicio>.onrender.com
+    host = os.environ.get("RENDER_EXTERNAL_URL") or PUBLIC_URL
+    if not host:
+        host = "https://psybrosfree.onrender.com"  # pon aquí tu URL si quieres fijarla
+
+    url_path = f"/telegram/webhook/{WEBHOOK_SECRET}"
+    webhook_url = host.rstrip("/") + url_path
+
+    log.info(f"🚀 Levantando webhook en {webhook_url} (puerto {PORT})")
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        secret_token=WEBHOOK_SECRET,
-        webhook_url=f"{BASE_URL.rstrip('/')}/{WEBHOOK_SECRET}",
+        url_path=url_path,               # el path exacto que atenderá el servidor
+        webhook_url=webhook_url,         # a dónde Telegram enviará los updates
+        secret_token=WEBHOOK_SECRET,     # protegido con tu secret
         drop_pending_updates=True,
     )
