@@ -3,17 +3,19 @@ import os
 import re
 import uuid
 import logging
+import asyncio
 from collections import deque
 from urllib.parse import urlparse, urlunparse, parse_qs
 
 import httpx
+from aiohttp import web
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InlineQueryResultArticle, InlineQueryResultPhoto, InputTextMessageContent,
 )
 from telegram.ext import (
     Application, MessageHandler, ContextTypes, filters,
-    InlineQueryHandler, CallbackQueryHandler, CommandHandler,
+    InlineQueryHandler, CallbackQueryHandler,
 )
 
 # -------- Config / Logging --------
@@ -22,17 +24,13 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("odesli-bot")
-logging.getLogger("aiohttp.access").setLevel(logging.INFO)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 COUNTRY = os.environ.get("ODESLI_COUNTRY", "CL").upper()
-WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
-PORT = int(os.environ.get("PORT", "10000"))
-PUBLIC_URL = os.environ.get("PUBLIC_URL")  # opcional: si no lo pasas usamos el onrender.com detectado
+PORT = int(os.environ.get("PORT", "8000"))  # Render provee PORT
 
 # -------- Utils --------
 URL_RE = re.compile(r"https?://\S+")
-
 MUSIC_DOMAINS = (
     "spotify.com",
     "music.apple.com", "itunes.apple.com", "geo.music.apple.com",
@@ -125,7 +123,7 @@ def regionalize_links_for_track(links: dict) -> dict:
         out[k] = {**info, "url": url}
     return out
 
-# ===== Derivar enlaces de ÁLBUM por plataforma =====
+# ===== Derivar enlaces de ÁLBUM =====
 ALBUM_LABEL = {
     "applemusic": "💿🍎",
     "spotify": "💿🎧",
@@ -246,7 +244,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
 
     botones = []
 
-    # 1) CANCION
+    # 1) Canción
     fila = []
     for k in keys_to_show:
         url = links[k].get("url")
@@ -259,7 +257,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
     if fila:
         botones.append(fila)
 
-    # 2) ÁLBUM
+    # 2) Álbum
     if album_buttons:
         botones.append([InlineKeyboardButton("💿 Álbum", callback_data=f"noop|{key}")])
         fila = []
@@ -300,10 +298,9 @@ async def fetch_odesli(url: str):
         log.warning(f"Odesli error: {e}")
         return None, None, None, None
 
-# -------- Handlers --------
+# -------- Chat handler --------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text if update.message else ""
-    urls = find_urls(text)
+    urls = find_urls(update.message.text if update.message else "")
     if not urls:
         return
     for url in urls:
@@ -332,12 +329,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=caption,
                     reply_markup=keyboard
                 )
-                return
+                continue
             except Exception as e:
                 log.info(f"No pude usar la portada, envío texto. {e}")
 
         await update.message.reply_text(caption, reply_markup=keyboard)
 
+# -------- Inline mode --------
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = (update.inline_query.query or "").strip()
     urls = find_urls(q)
@@ -379,6 +377,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         )]
     await update.inline_query.answer(results, cache_time=10, is_personal=True)
 
+# -------- Callbacks --------
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     await cq.answer()
@@ -412,47 +411,44 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning(f"No pude editar el teclado: {e}")
 
-# --- Handlers de prueba/diagnóstico ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Estoy vivo. Envíame un link de Spotify/YouTube/Apple Music.")
-
-async def tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # último por si algo no coincidió con otros handlers
-    log.info("Recibí un update que no coincidió con filtros: %s", update.to_dict())
-
 # -------- Post-init / main --------
 async def _post_init(app: Application):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Webhook previo eliminado.")
+        log.info("Webhook eliminado; inline + polling listos.")
     except Exception as e:
         log.warning(f"No pude limpiar webhook: {e}")
 
+# ---- Mini servidor HTTP para keep-alive
+async def health_handler(request):
+    return web.Response(text="ok")
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/healthz", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info(f"Health server listo en :{PORT}/healthz")
+
+async def main():
+    # Telegram app
+    tg = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
+    tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    tg.add_handler(InlineQueryHandler(handle_inline_query))
+    tg.add_handler(CallbackQueryHandler(callbacks))
+
+    # Arranca health server y polling en paralelo
+    await start_health_server()
+    log.info("✅ Iniciando en modo POLLING…")
+    await tg.initialize()
+    await tg.start()
+    await tg.updater.start_polling(drop_pending_updates=True)
+
+    # Mantener proceso vivo
+    await asyncio.Event().wait()
+
 if __name__ == "__main__":
-    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
-
-    # Handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(InlineQueryHandler(handle_inline_query))
-    app.add_handler(CallbackQueryHandler(callbacks))
-    app.add_handler(MessageHandler(filters.ALL, tap))  # al final
-
-    # --- Webhook ---
-    # Si no pones PUBLIC_URL como env var, Render te publica en https://<tu-servicio>.onrender.com
-    host = os.environ.get("RENDER_EXTERNAL_URL") or PUBLIC_URL
-    if not host:
-        host = "https://psybrosfree.onrender.com"  # pon aquí tu URL si quieres fijarla
-
-    url_path = f"/telegram/webhook/{WEBHOOK_SECRET}"
-    webhook_url = host.rstrip("/") + url_path
-
-    log.info(f"🚀 Levantando webhook en {webhook_url} (puerto {PORT})")
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=url_path,               # el path exacto que atenderá el servidor
-        webhook_url=webhook_url,         # a dónde Telegram enviará los updates
-        secret_token=WEBHOOK_SECRET,     # protegido con tu secret
-        drop_pending_updates=True,
-    )
+    asyncio.run(main())
