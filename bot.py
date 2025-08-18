@@ -244,7 +244,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
 
     botones = []
 
-    # 1) Canción / Artista (en ambos casos son enlaces por plataforma)
+    # 1) Canción (favoritos primero)
     fila = []
     for k in keys_to_show:
         url = links[k].get("url")
@@ -257,7 +257,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
     if fila:
         botones.append(fila)
 
-    # 2) Álbum (solo si hay)
+    # 2) Álbum (solo si aplica)
     if album_buttons:
         botones.append([InlineKeyboardButton("💿 Álbum", callback_data=f"noop|{key}")])
         fila = []
@@ -276,8 +276,29 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
 
     return InlineKeyboardMarkup(botones)
 
+# ===== Deducción de tipo de entidad (artist/album/track) =====
+def _entity_kind_from_uid(uid: str) -> str:
+    """
+    Intenta deducir el tipo de entidad a partir del entityUniqueId de Odesli.
+    Devuelve: 'artist' | 'album' | 'track' | 'unknown'
+    """
+    if not uid:
+        return "unknown"
+    u = uid.lower()
+    if "artist" in u:
+        return "artist"
+    if "album" in u:
+        return "album"
+    if "song" in u or "track" in u:
+        return "track"
+    return "unknown"
+
 # ===== Odesli =====
 async def fetch_odesli(url: str):
+    """
+    Devuelve (links_by_platform, title, artist, cover_url, kind)
+    kind: 'artist' | 'album' | 'track' | 'unknown'
+    """
     api = "https://api.song.link/v1-alpha.1/links"
     params = {"url": url, "userCountry": COUNTRY}
     headers = {"Accept-Language": f"es-{COUNTRY},es;q=0.9,en;q=0.8"}
@@ -285,52 +306,30 @@ async def fetch_odesli(url: str):
         async with httpx.AsyncClient() as client:
             r = await client.get(api, params=params, headers=headers, timeout=12)
         if r.status_code != 200:
-            return None, None, None, None
+            return None, None, None, None, "unknown"
+
         data = r.json()
         raw_links = data.get("linksByPlatform", {}) or {}
         links_norm = normalize_links(raw_links)
-        links_for_track = regionalize_links_for_track(links_norm)
 
         uid = data.get("entityUniqueId")
+        kind = _entity_kind_from_uid(uid or "")
+
+        # Para tracks, regionalizamos Apple (conserva ?i=); para artista/álbum, no.
+        if kind == "track":
+            links_out = regionalize_links_for_track(links_norm)
+        else:
+            links_out = links_norm
+
         entity = data.get("entitiesByUniqueId", {}).get(uid, {}) if uid else {}
-        return links_for_track or None, entity.get("title"), entity.get("artistName"), entity.get("thumbnailUrl")
+        title = entity.get("title")
+        artist = entity.get("artistName") or entity.get("name")
+        cover = entity.get("thumbnailUrl")
+
+        return links_out or None, title, artist, cover, kind
     except Exception as e:
         log.warning(f"Odesli error: {e}")
-        return None, None, None, None
-
-# ====== NUEVO: soporte ARTISTAS ======
-def looks_like_artist_url(url: str) -> bool:
-    p = urlparse(url)
-    host = p.netloc.lower()
-    path = p.path.lower()
-    return (
-        ("music.apple.com" in host and "/artist/" in path) or
-        ("spotify.com" in host and "/artist/" in path)
-    )
-
-async def fetch_odesli_artist(url: str):
-    """Artist.link: devuelve (links_by_platform, artist_name, cover)."""
-    api = "https://api.song.link/v1-alpha.1/artist"
-    params = {"url": url, "userCountry": COUNTRY}
-    headers = {"Accept-Language": f"es-{COUNTRY},es;q=0.9,en;q=0.8"}
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(api, params=params, headers=headers, timeout=12)
-        if r.status_code != 200:
-            return None, None, None
-        data = r.json()
-        raw_links = data.get("linksByPlatform", {}) or {}
-        links_norm = normalize_links(raw_links)
-        # nombre/portada
-        name = data.get("artistName")
-        if not name:
-            uid = data.get("entityUniqueId")
-            name = data.get("entitiesByUniqueId", {}).get(uid or "", {}).get("artistName")
-        cover = data.get("thumbnailUrl")
-        return links_norm or None, name, cover
-    except Exception as e:
-        log.warning(f"Odesli ARTIST error: {e}")
-        return None, None, None
+        return None, None, None, None, "unknown"
 
 # -------- Chat handler --------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -341,31 +340,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_music_url(url):
             continue
 
-        links, title, artist, cover = await fetch_odesli(url)
-        album_buttons = []
-        # Intentar como ARTISTA cuando no hay links
-        if not links and looks_like_artist_url(url):
-            alinks, aname, acover = await fetch_odesli_artist(url)
-            if alinks:
-                links, title, artist, cover = alinks, None, aname, acover
-
+        links, title, artist, cover, kind = await fetch_odesli(url)
         if not links:
             continue
 
-        # Solo para canciones/álbumes/playlist generamos botones de álbum
-        if title or (artist and not looks_like_artist_url(url)):
-            album_buttons = await derive_album_buttons_all(links)
-
+        # Artista: sin botones de Álbum; Track: sí intenta derivarlos
+        album_buttons = [] if kind == "artist" else await derive_album_buttons_all(links)
         key = remember_links(links, album_buttons)
         keyboard = build_keyboard(links, show_all=False, key=key, album_buttons=album_buttons)
 
-        caption = "🎶 Disponible en:"
-        if title and artist:
-            caption = f"🎵 {title} — {artist}\n🎶 Disponible en:"
-        elif title:
-            caption = f"🎵 {title}\n🎶 Disponible en:"
-        elif artist:  # ARTISTA
-            caption = f"👤 {artist}\n🎶 Disponible en:"
+        # Caption según tipo
+        if kind == "artist":
+            header = f"👤 {artist or title or 'Artista'}\n"
+            caption = f"{header}🔗 Disponible en:"
+        else:
+            caption = "🎶 Disponible en:"
+            if title and artist:
+                caption = f"🎵 {title} — {artist}\n🎶 Disponible en:"
+            elif title:
+                caption = f"🎵 {title}\n🎶 Disponible en:"
 
         if cover:
             try:
@@ -394,40 +387,36 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.inline_query.answer([], cache_time=10, is_personal=True)
         return
 
-    links, title, artist, cover = await fetch_odesli(url)
-    album_buttons = []
-    if not links and looks_like_artist_url(url):
-        alinks, aname, acover = await fetch_odesli_artist(url)
-        if alinks:
-            links, title, artist, cover = alinks, None, aname, acover
-
+    links, title, artist, cover, kind = await fetch_odesli(url)
     if not links:
         await update.inline_query.answer([], cache_time=5, is_personal=True)
         return
 
-    if title or (artist and not looks_like_artist_url(url)):
-        album_buttons = await derive_album_buttons_all(links)
-
+    album_buttons = [] if kind == "artist" else await derive_album_buttons_all(links)
     key = remember_links(links, album_buttons)
     keyboard = build_keyboard(links, show_all=False, key=key, album_buttons=album_buttons)
 
-    caption = "🎶 Disponible en:"
-    if title and artist:
-        caption = f"🎵 {title} — {artist}\n🎶 Disponible en:"
-    elif title:
-        caption = f"🎵 {title}\n🎶 Disponible en:"
-    elif artist:
-        caption = f"👤 {artist}\n🎶 Disponible en:"
+    if kind == "artist":
+        header = f"👤 {artist or title or 'Artista'}\n"
+        caption = f"{header}🔗 Disponible en:"
+        title_for_inline = artist or title or "Artista"
+    else:
+        caption = "🎶 Disponible en:"
+        if title and artist:
+            caption = f"🎵 {title} — {artist}\n🎶 Disponible en:"
+        elif title:
+            caption = f"🎵 {title}\n🎶 Disponible en:"
+        title_for_inline = title or "Plataformas"
 
     rid = str(uuid.uuid4())
     if cover:
         results = [InlineQueryResultPhoto(
             id=rid, photo_url=cover, thumb_url=cover,
-            caption=caption, reply_markup=keyboard, title=title or artist or "Plataformas"
+            caption=caption, reply_markup=keyboard, title=title_for_inline
         )]
     else:
         results = [InlineQueryResultArticle(
-            id=rid, title=title or artist or "Plataformas",
+            id=rid, title=title_for_inline,
             input_message_content=InputTextMessageContent(caption),
             reply_markup=keyboard, description="Enviar accesos a otras plataformas"
         )]
