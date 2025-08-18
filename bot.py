@@ -244,7 +244,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
 
     botones = []
 
-    # 1) Canción
+    # 1) Canción / Artista (en ambos casos son enlaces por plataforma)
     fila = []
     for k in keys_to_show:
         url = links[k].get("url")
@@ -257,7 +257,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
     if fila:
         botones.append(fila)
 
-    # 2) Álbum
+    # 2) Álbum (solo si hay)
     if album_buttons:
         botones.append([InlineKeyboardButton("💿 Álbum", callback_data=f"noop|{key}")])
         fila = []
@@ -298,6 +298,40 @@ async def fetch_odesli(url: str):
         log.warning(f"Odesli error: {e}")
         return None, None, None, None
 
+# ====== NUEVO: soporte ARTISTAS ======
+def looks_like_artist_url(url: str) -> bool:
+    p = urlparse(url)
+    host = p.netloc.lower()
+    path = p.path.lower()
+    return (
+        ("music.apple.com" in host and "/artist/" in path) or
+        ("spotify.com" in host and "/artist/" in path)
+    )
+
+async def fetch_odesli_artist(url: str):
+    """Artist.link: devuelve (links_by_platform, artist_name, cover)."""
+    api = "https://api.song.link/v1-alpha.1/artist"
+    params = {"url": url, "userCountry": COUNTRY}
+    headers = {"Accept-Language": f"es-{COUNTRY},es;q=0.9,en;q=0.8"}
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(api, params=params, headers=headers, timeout=12)
+        if r.status_code != 200:
+            return None, None, None
+        data = r.json()
+        raw_links = data.get("linksByPlatform", {}) or {}
+        links_norm = normalize_links(raw_links)
+        # nombre/portada
+        name = data.get("artistName")
+        if not name:
+            uid = data.get("entityUniqueId")
+            name = data.get("entitiesByUniqueId", {}).get(uid or "", {}).get("artistName")
+        cover = data.get("thumbnailUrl")
+        return links_norm or None, name, cover
+    except Exception as e:
+        log.warning(f"Odesli ARTIST error: {e}")
+        return None, None, None
+
 # -------- Chat handler --------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     urls = find_urls(update.message.text if update.message else "")
@@ -308,10 +342,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         links, title, artist, cover = await fetch_odesli(url)
+        album_buttons = []
+        # Intentar como ARTISTA cuando no hay links
+        if not links and looks_like_artist_url(url):
+            alinks, aname, acover = await fetch_odesli_artist(url)
+            if alinks:
+                links, title, artist, cover = alinks, None, aname, acover
+
         if not links:
             continue
 
-        album_buttons = await derive_album_buttons_all(links)
+        # Solo para canciones/álbumes/playlist generamos botones de álbum
+        if title or (artist and not looks_like_artist_url(url)):
+            album_buttons = await derive_album_buttons_all(links)
+
         key = remember_links(links, album_buttons)
         keyboard = build_keyboard(links, show_all=False, key=key, album_buttons=album_buttons)
 
@@ -320,6 +364,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption = f"🎵 {title} — {artist}\n🎶 Disponible en:"
         elif title:
             caption = f"🎵 {title}\n🎶 Disponible en:"
+        elif artist:  # ARTISTA
+            caption = f"👤 {artist}\n🎶 Disponible en:"
 
         if cover:
             try:
@@ -349,11 +395,19 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     links, title, artist, cover = await fetch_odesli(url)
+    album_buttons = []
+    if not links and looks_like_artist_url(url):
+        alinks, aname, acover = await fetch_odesli_artist(url)
+        if alinks:
+            links, title, artist, cover = alinks, None, aname, acover
+
     if not links:
         await update.inline_query.answer([], cache_time=5, is_personal=True)
         return
 
-    album_buttons = await derive_album_buttons_all(links)
+    if title or (artist and not looks_like_artist_url(url)):
+        album_buttons = await derive_album_buttons_all(links)
+
     key = remember_links(links, album_buttons)
     keyboard = build_keyboard(links, show_all=False, key=key, album_buttons=album_buttons)
 
@@ -362,16 +416,18 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         caption = f"🎵 {title} — {artist}\n🎶 Disponible en:"
     elif title:
         caption = f"🎵 {title}\n🎶 Disponible en:"
+    elif artist:
+        caption = f"👤 {artist}\n🎶 Disponible en:"
 
     rid = str(uuid.uuid4())
     if cover:
         results = [InlineQueryResultPhoto(
             id=rid, photo_url=cover, thumb_url=cover,
-            caption=caption, reply_markup=keyboard, title=title or "Plataformas"
+            caption=caption, reply_markup=keyboard, title=title or artist or "Plataformas"
         )]
     else:
         results = [InlineQueryResultArticle(
-            id=rid, title=title or "Plataformas",
+            id=rid, title=title or artist or "Plataformas",
             input_message_content=InputTextMessageContent(caption),
             reply_markup=keyboard, description="Enviar accesos a otras plataformas"
         )]
