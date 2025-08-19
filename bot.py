@@ -4,8 +4,9 @@ import re
 import uuid
 import logging
 import asyncio
+import html
 from collections import deque
-from urllib.parse import urlparse, urlunparse, parse_qs, quote_plus
+from urllib.parse import urlparse, urlunparse, parse_qs, unquote
 
 import httpx
 from aiohttp import web
@@ -166,15 +167,15 @@ async def _ytm_album_from_page(url: str, prefer_music: bool = True):
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(url, headers=headers, timeout=12)
-        html = r.text
-        m = re.search(r'"playlistId":"(OLAK[^"]+)"', html) or re.search(r'list=(OLAK[^"&]+)', html)
+        html_src = r.text
+        m = re.search(r'"playlistId":"(OLAK[^"]+)"', html_src) or re.search(r'list=(OLAK[^"&]+)', html_src)
         if m:
             pid = m.group(1)
             if prefer_music:
                 return f"https://music.youtube.com/playlist?list={pid}", None
             else:
                 return f"https://www.youtube.com/playlist?list={pid}", None
-        m = re.search(r'"browseId":"(MPREb[^"]+)"', html) or re.search(r'/browse/(MPREb[^"?]+)', html)
+        m = re.search(r'"browseId":"(MPREb[^"]+)"', html_src) or re.search(r'/browse/(MPREb[^"?]+)', html_src)
         if m:
             bid = m.group(1)
             return f"https://music.youtube.com/browse/{bid}", None
@@ -276,7 +277,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
 
     return InlineKeyboardMarkup(botones)
 
-# ===== Odesli (tracks/álbum por URL) =====
+# ===== Odesli (pistas) =====
 async def fetch_odesli(url: str):
     api = "https://api.song.link/v1-alpha.1/links"
     params = {"url": url, "userCountry": COUNTRY}
@@ -298,99 +299,112 @@ async def fetch_odesli(url: str):
         log.warning(f"Odesli error: {e}")
         return None, None, None, None
 
-# ===== NUEVO: Detección/obtención de ARTISTA =====
-def _normalize_spotify_url(u: str) -> str:
-    # quita /intl-xx/ si viene en la ruta
-    p = urlparse(u)
-    parts = p.path.split("/")
-    if len(parts) > 2 and parts[1].startswith("intl-"):
-        parts.pop(1)
-        new_path = "/".join(parts)
-        u = urlunparse((p.scheme, p.netloc, new_path, p.params, p.query, p.fragment))
-    return u
-
-def is_spotify_artist(url: str) -> bool:
-    p = urlparse(url)
-    return ("spotify.com" in p.netloc) and ("/artist/" in _normalize_spotify_url(url))
-
-def is_apple_artist(url: str) -> bool:
-    p = urlparse(url)
-    host = p.netloc.lower()
-    path = p.path.lower()
-    return ("apple.com" in host) and ("/artist/" in path)
-
-async def get_spotify_artist_name(artist_url: str) -> str | None:
-    """Intenta obtener el nombre del artista vía oEmbed y luego HTML OG tags."""
-    url = _normalize_spotify_url(artist_url)
-    headers = {"User-Agent": "Mozilla/5.0"}
+# ===== Artistas: detección + extracción de nombre + búsquedas =====
+def is_artist_url(url: str) -> bool:
     try:
-        # 1) oEmbed (rápido y fiable)
-        oembed = f"https://open.spotify.com/oembed?url={quote_plus(url)}"
-        async with httpx.AsyncClient() as client:
-            r = await client.get(oembed, headers=headers, timeout=10)
-        if r.status_code == 200:
-            title = (r.json() or {}).get("title")
-            if title:
-                return title.strip()
-    except Exception as e:
-        log.debug(f"oEmbed Spotify falló: {e}")
+        p = urlparse(url)
+        host = p.netloc.lower()
+        path = p.path.lower()
+        if ("music.apple.com" in host or "itunes.apple.com" in host) and "/artist/" in path:
+            return True
+        if ("open.spotify.com" in host) and "/artist/" in path:
+            return True
+        return False
+    except Exception:
+        return False
 
+def _clean_candidate(text: str) -> str:
+    # elimina cosas como "en Apple Music", "en Spotify", etc.
+    text = re.sub(r"\s+en\s+(apple\s*music|spotify|youtube(\s*music)?|soundcloud).*", "", text, flags=re.I)
+    text = re.sub(r"\s*\(.*?\)\s*$", "", text)  # paréntesis finales
+    return text.strip()
+
+def _artist_from_apple_slug(url: str) -> str | None:
+    # Apple suele tener /artist/<slug>/<id>
     try:
-        # 2) Respaldo: HTML
-        async with httpx.AsyncClient() as client:
-            r = await client.get(url, headers=headers, timeout=12)
-        if r.status_code == 200:
-            html = r.text
-            # og:title
-            m = re.search(r'<meta property="og:title" content="([^"]+)"', html)
-            if m:
-                return m.group(1).strip()
-            # title tag
-            m = re.search(r"<title>([^<]+)</title>", html)
-            if m:
-                return m.group(1).replace(" | Spotify", "").strip()
-    except Exception as e:
-        log.debug(f"Scrape Spotify falló: {e}")
-
+        p = urlparse(url)
+        parts = [s for s in p.path.split("/") if s]
+        if "artist" in parts:
+            i = parts.index("artist")
+            if i + 1 < len(parts):
+                slug = unquote(parts[i + 1])
+                slug = slug.replace("-", " ").strip()
+                if slug and not slug.isnumeric():
+                    # Normaliza mayúsculas (pero respeta acrónimos)
+                    return slug.title()
+    except Exception:
+        pass
     return None
 
-async def get_apple_artist_name(artist_url: str) -> str | None:
-    """Obtiene nombre de artista desde Apple Music vía OG/title (regionalizando)."""
-    url = _regionalize_apple(artist_url, for_album=False)
-    headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": f"es-{COUNTRY},es;q=0.9,en;q=0.8"}
+async def _artist_from_page_title(url: str) -> str | None:
+    # Plan C: rascar <meta property="og:title" ...> o <title>
     try:
+        headers = {"User-Agent": "Mozilla/5.0"}
         async with httpx.AsyncClient() as client:
-            r = await client.get(url, headers=headers, timeout=12)
-        if r.status_code == 200:
-            html = r.text
-            m = re.search(r'<meta property="og:title" content="([^"]+)"', html)
-            if m:
-                return m.group(1).strip()
-            m = re.search(r"<title>([^<]+)</title>", html)
-            if m:
-                # En Apple suele ser "Nombre en Apple Music" o similar
-                return m.group(1).replace(" en Apple Music", "").strip()
+            r = await client.get(url, headers=headers, timeout=10)
+        html_src = r.text or ""
+        # og:title primero
+        m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html_src, re.I)
+        if not m:
+            m = re.search(r"<title>([^<]+)</title>", html_src, re.I)
+        if m:
+            raw = html.unescape(m.group(1)).strip()
+            # ejemplos: "Gorillaz en Apple Music", "Gorillaz | Spotify"
+            raw = re.sub(r"\s*\|\s*Spotify.*$", "", raw, flags=re.I)
+            raw = _clean_candidate(raw)
+            # corta añadidos típicos
+            raw = re.sub(r"\s+on\s+Apple\s*Music.*$", "", raw, flags=re.I)
+            if raw:
+                return raw
     except Exception as e:
-        log.debug(f"Apple artist scrape falló: {e}")
+        log.debug(f"No pude extraer título de página: {e}")
     return None
 
-def build_artist_search_keyboard(artist_name: str) -> InlineKeyboardMarkup:
-    q = quote_plus(artist_name)
-    links = [
-        ("Espotifai",  f"https://open.spotify.com/search/{q}"),
-        ("Yutú",      f"https://www.youtube.com/results?search_query={q}"),
-        ("Yutúmusic", f"https://music.youtube.com/search?q={q}"),
-        ("Manzanita", f"https://music.apple.com/search?term={q}&entity=musicArtist"),
-        ("SounClou",  f"https://soundcloud.com/search/people?q={q}"),
-        ("Bandcamp",  f"https://bandcamp.com/search?q={q}&item_type=b"),
-    ]
-    rows, row = [], []
-    for txt, url in links:
-        row.append(InlineKeyboardButton(txt, url=url))
-        if len(row) == 3:
-            rows.append(row); row = []
-    if row: rows.append(row)
-    return InlineKeyboardMarkup(rows)
+async def extract_artist_name(url: str, message_text: str) -> str | None:
+    # A) Apple: usa slug
+    name = _artist_from_apple_slug(url)
+    if name:
+        return name
+
+    # B) Texto alrededor: quita el URL y usa lo restante si parece un nombre
+    if message_text:
+        text = message_text.replace(url, " ").strip()
+        text = _clean_candidate(text)
+        # si quedó algo "humano"
+        if 1 <= len(text) <= 80 and not URL_RE.search(text):
+            return text
+
+    # C) Rascar título/og:title
+    name = await _artist_from_page_title(url)
+    return name
+
+def build_artist_search_links(artist: str) -> dict:
+    q = artist.strip()
+    if not q:
+        return {}
+    # No encodamos con quote_plus porque la mayoría acepta espacios; agregamos simple escape
+    query = q.replace("#", "")
+    return {
+        "spotify": {"url": f"https://open.spotify.com/search/{query}"},
+        "youtube": {"url": f"https://www.youtube.com/results?search_query={query}"},
+        "youtubemusic": {"url": f"https://music.youtube.com/search?q={query}"},
+        "applemusic": {"url": f"https://music.apple.com/search?term={query}"},
+        "soundcloud": {"url": f"https://soundcloud.com/search?q={query}"},
+        "bandcamp": {"url": f"https://bandcamp.com/search?q={query}"},
+    }
+
+def build_artist_keyboard(links: dict) -> InlineKeyboardMarkup:
+    # muestra favoritos primero (spotify, youtube, ytm, applemusic, soundcloud) y luego bandcamp
+    order = sort_keys(links)
+    botones, fila = [], []
+    for k in order:
+        url = links[k]["url"]
+        fila.append(InlineKeyboardButton(nice_name(k), url=url))
+        if len(fila) == 3:
+            botones.append(fila); fila = []
+    if fila:
+        botones.append(fila)
+    return InlineKeyboardMarkup(botones)
 
 # -------- Chat handler --------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -398,30 +412,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     urls = find_urls(text)
     if not urls:
         return
-
     for url in urls:
         if not is_music_url(url):
             continue
 
-        # 1) ARTISTA: Spotify
-        if is_spotify_artist(url):
-            name = await get_spotify_artist_name(url)
-            if name:
-                kb = build_artist_search_keyboard(name)
-                await update.message.reply_text(f"👤 {name}\n🔎 Búscalo en:", reply_markup=kb)
-                continue
-            # si fallo, seguimos al flujo normal
+        # 1) ¿Es ARTISTA?
+        if is_artist_url(url):
+            artist = await extract_artist_name(url, text)
+            if not artist:
+                # como último recurso, usa palabra "Artista"
+                artist = "Artista"
+            search_links = build_artist_search_links(artist)
+            caption = f"🧑‍🎤 {artist}\n🔎 Búscalo en:"
+            kb = build_artist_keyboard(search_links)
+            await update.message.reply_text(caption, reply_markup=kb)
+            continue
 
-        # 2) ARTISTA: Apple Music
-        if is_apple_artist(url):
-            name = await get_apple_artist_name(url)
-            if name:
-                kb = build_artist_search_keyboard(name)
-                await update.message.reply_text(f"👤 {name}\n🔎 Búscalo en:", reply_markup=kb)
-                continue
-            # si fallo, seguimos al flujo normal
-
-        # 3) TRACK/ALBUM: vía Odesli
+        # 2) PISTA / ÁLBUM vía Odesli
         links, title, artist, cover = await fetch_odesli(url)
         if not links:
             continue
@@ -463,34 +470,22 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.inline_query.answer([], cache_time=10, is_personal=True)
         return
 
-    # Inline: si es artista, construimos búsqueda de artista
-    if is_spotify_artist(url):
-        name = await get_spotify_artist_name(url)
-        if name:
-            kb = build_artist_search_keyboard(name)
-            rid = str(uuid.uuid4())
-            results = [InlineQueryResultArticle(
-                id=rid, title=name,
-                input_message_content=InputTextMessageContent(f"👤 {name}\n🔎 Búscalo en:"),
-                reply_markup=kb, description="Buscar artista en otras plataformas"
-            )]
-            await update.inline_query.answer(results, cache_time=10, is_personal=True)
-            return
+    # Artista en inline
+    if is_artist_url(url):
+        artist = await extract_artist_name(url, q) or "Artista"
+        search_links = build_artist_search_links(artist)
+        kb = build_artist_keyboard(search_links)
+        caption = f"🧑‍🎤 {artist}\n🔎 Búscalo en:"
+        rid = str(uuid.uuid4())
+        results = [InlineQueryResultArticle(
+            id=rid, title=f"Buscar {artist}",
+            input_message_content=InputTextMessageContent(caption),
+            reply_markup=kb, description="Recomendar artista en otras plataformas"
+        )]
+        await update.inline_query.answer(results, cache_time=10, is_personal=True)
+        return
 
-    if is_apple_artist(url):
-        name = await get_apple_artist_name(url)
-        if name:
-            kb = build_artist_search_keyboard(name)
-            rid = str(uuid.uuid4())
-            results = [InlineQueryResultArticle(
-                id=rid, title=name,
-                input_message_content=InputTextMessageContent(f"👤 {name}\n🔎 Búscalo en:"),
-                reply_markup=kb, description="Buscar artista en otras plataformas"
-            )]
-            await update.inline_query.answer(results, cache_time=10, is_personal=True)
-            return
-
-    # Si no es artista o falló, probamos Odesli
+    # Pista/álbum en inline
     links, title, artist, cover = await fetch_odesli(url)
     if not links:
         await update.inline_query.answer([], cache_time=5, is_personal=True)
