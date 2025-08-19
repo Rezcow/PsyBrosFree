@@ -5,7 +5,9 @@ import uuid
 import logging
 import asyncio
 from collections import deque
-from urllib.parse import urlparse, urlunparse, parse_qs, quote, unquote
+from urllib.parse import (
+    urlparse, urlunparse, parse_qs, quote, unquote, quote_plus
+)
 
 import httpx
 from aiohttp import web
@@ -29,6 +31,11 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 COUNTRY = os.environ.get("ODESLI_COUNTRY", "CL").upper()
 PORT = int(os.environ.get("PORT", "8000"))  # Render provee PORT
 
+# Nuevo: API key de setlist.fm
+SETLIST_FM_API_KEY = os.environ.get("SETLIST_FM_API_KEY", "").strip()
+SETLIST_PAGE_SIZE = int(os.environ.get("SETLIST_PAGE_SIZE", "10"))
+SETLIST_MAX_CONCURRENCY = int(os.environ.get("SETLIST_MAX_CONCURRENCY", "5"))
+
 # -------- Utils --------
 URL_RE = re.compile(r"https?://\S+")
 MUSIC_DOMAINS = (
@@ -40,11 +47,20 @@ MUSIC_DOMAINS = (
     "anghami.com", "boomplay.com", "amazonmusic.com", "music.amazon.",
     "audius.co",
 )
+SETLIST_DOMAIN = "setlist.fm"
 
 def is_music_url(url: str) -> bool:
     try:
         host = urlparse(url).netloc.lower()
         return any(d in host for d in MUSIC_DOMAINS)
+    except Exception:
+        return False
+
+def is_setlist_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        host = p.netloc.lower()
+        return SETLIST_DOMAIN in host and "/setlist/" in p.path.lower()
     except Exception:
         return False
 
@@ -136,7 +152,6 @@ def _apple_artist_slug_to_name(path: str) -> str | None:
             i = parts.index("artist")
             if i + 1 < len(parts):
                 slug = unquote(parts[i + 1])
-                # slug puede traer guiones
                 name = slug.replace("-", " ").strip()
                 if name:
                     return name.title()
@@ -156,7 +171,6 @@ async def _spotify_artist_name_from_oembed(url: str) -> str | None:
         if r.status_code == 200:
             title = (r.json() or {}).get("title")
             if title:
-                # Suele venir ya correcto: "Gorillaz"
                 return str(title).strip()
     except Exception as e:
         log.debug(f"Spotify oEmbed falló: {e}")
@@ -360,6 +374,9 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
 
 # ===== Odesli (canciones) =====
 async def fetch_odesli(url: str):
+    """
+    Devuelve: (links_for_track, title, artist_name, thumbnail_url, page_url)
+    """
     api = "https://api.song.link/v1-alpha.1/links"
     params = {"url": url, "userCountry": COUNTRY}
     headers = {"Accept-Language": f"es-{COUNTRY},es;q=0.9,en;q=0.8"}
@@ -367,65 +384,336 @@ async def fetch_odesli(url: str):
         async with httpx.AsyncClient() as client:
             r = await client.get(api, params=params, headers=headers, timeout=12)
         if r.status_code != 200:
-            return None, None, None, None
+            return None, None, None, None, None
         data = r.json()
-        raw_links = data.get("linksByPlatform", {}) or {}
+        raw_links = (data.get("linksByPlatform", {}) or {})
         links_norm = normalize_links(raw_links)
         links_for_track = regionalize_links_for_track(links_norm)
 
         uid = data.get("entityUniqueId")
         entity = data.get("entitiesByUniqueId", {}).get(uid, {}) if uid else {}
-        return links_for_track or None, entity.get("title"), entity.get("artistName"), entity.get("thumbnailUrl")
+        title = entity.get("title")
+        artist = entity.get("artistName")
+        thumb = entity.get("thumbnailUrl")
+        page_url = data.get("pageUrl") or data.get("pageUrlShort") or data.get("url")
+
+        return links_for_track or None, title, artist, thumb, page_url
     except Exception as e:
         log.warning(f"Odesli error: {e}")
-        return None, None, None, None
+        return None, None, None, None, None
+
+# ======== SETLIST.FM: extracción, resolución y teclado paginado ========
+
+SETLIST_CACHE: dict[str, dict] = {}  # setlistId -> {'meta':..., 'songs':[...]}
+
+def _extract_setlist_id(url: str) -> str | None:
+    """
+    Ej: https://www.setlist.fm/setlist/limp-bizkit/2025/atakoy-marina-istanbul-turkey-23471c4b.html -> 23471c4b
+    """
+    try:
+        p = urlparse(url)
+        m = re.search(r"([0-9a-f]{8})(?:\.html)?$", p.path.lower())
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+async def fetch_setlist_json(setlist_id: str) -> dict | None:
+    if not SETLIST_FM_API_KEY:
+        log.warning("Falta SETLIST_FM_API_KEY")
+        return None
+    url = f"https://api.setlist.fm/rest/1.0/setlist/{setlist_id}"
+    headers = {
+        "x-api-key": SETLIST_FM_API_KEY,
+        "Accept": "application/json",
+        "Accept-Language": f"es-{COUNTRY},es;q=0.9,en;q=0.8",
+        "User-Agent": "setlist-resolver-bot/1.0",
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+        log.warning(f"setlist.fm {setlist_id} -> {r.status_code}: {r.text[:300]}")
+    except Exception as e:
+        log.warning(f"Error consultando setlist.fm: {e}")
+    return None
+
+def _ensure_list(x):
+    if not x:
+        return []
+    if isinstance(x, list):
+        return x
+    return [x]
+
+def parse_setlist_songs(js: dict) -> tuple[dict, list[dict]]:
+    """
+    Devuelve: meta, songs
+    meta: {'artist':..., 'venue':..., 'city':..., 'country':..., 'eventDate':..., 'url':...}
+    song: {'title': '...', 'is_tape': bool, 'cover': 'Nombre'|None}
+    """
+    if not js:
+        return {}, []
+    artist = (js.get("artist") or {}).get("name")
+    venue = (js.get("venue") or {}).get("name")
+    city = ((js.get("venue") or {}).get("city") or {}).get("name")
+    country = (((js.get("venue") or {}).get("city") or {}).get("country") or {}).get("code")
+    event_date = js.get("eventDate")  # dd-mm-yyyy
+    url = js.get("url") or ""
+    sets = ((js.get("sets") or {}).get("set")) or []
+    sets = _ensure_list(sets)
+
+    songs = []
+    for s in sets:
+        items = _ensure_list(s.get("song"))
+        for it in items:
+            title = (it or {}).get("name")
+            if not title:
+                continue
+            is_tape = bool((it or {}).get("tape"))
+            cover = ((it or {}).get("cover") or {}).get("name")
+            songs.append({"title": title, "is_tape": is_tape, "cover": cover})
+
+    meta = {
+        "artist": artist, "venue": venue, "city": city,
+        "country": country, "eventDate": event_date, "url": url
+    }
+    return meta, songs
+
+async def apple_search_track_url(artist: str, title: str) -> str | None:
+    """
+    Busca una pista en Apple/iTunes y devuelve un track URL utilizable por Odesli.
+    """
+    term = f"{artist} {title}".strip()
+    params = {
+        "term": term,
+        "entity": "song",
+        "limit": 1,
+        "country": COUNTRY,
+        "media": "music",
+    }
+    url = "https://itunes.apple.com/search"
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, params=params, timeout=12)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        results = data.get("results") or []
+        if not results:
+            return None
+        track_url = results[0].get("trackViewUrl")
+        if not track_url:
+            return None
+        return _regionalize_apple(track_url, for_album=False)
+    except Exception as e:
+        log.debug(f"Apple search falló para '{term}': {e}")
+        return None
+
+async def resolve_song_links(artist: str, title: str) -> tuple[dict | None, str | None]:
+    """
+    Intenta resolver plataformas via Apple -> Odesli.
+    Devuelve (links_by_platform | None, odesli_page_url | None)
+    """
+    seed = await apple_search_track_url(artist, title)
+    if not seed:
+        return None, None
+    links, t, a, thumb, page_url = await fetch_odesli(seed)
+    return links, page_url
+
+def _pick_youtube_key(links: dict) -> str | None:
+    # Preferimos YouTube Music si existe
+    if "youtubemusic" in links:
+        return "youtubemusic"
+    if "youtube" in links:
+        return "youtube"
+    return None
+
+# Memoria temporal para teclados de setlist
+SETLIST_STORE: dict[str, dict] = {}
+SETLIST_ORDER = deque(maxlen=120)
+
+def remember_setlist(setlist_id: str, meta: dict, items: list[dict]) -> str:
+    key = uuid.uuid4().hex
+    SETLIST_STORE[key] = {"setlist_id": setlist_id, "meta": meta, "items": items}
+    SETLIST_ORDER.append(key)
+    while len(SETLIST_STORE) > SETLIST_ORDER.maxlen:
+        old = SETLIST_ORDER.popleft()
+        SETLIST_STORE.pop(old, None)
+    return key
+
+def _format_song_label(idx: int, title: str, cover: str | None) -> str:
+    base = f"{idx}. {title}"
+    if cover:
+        return f"{base} (cover de {cover})"
+    return base
+
+def build_setlist_keyboard(key: str, page: int) -> InlineKeyboardMarkup:
+    entry = SETLIST_STORE.get(key)
+    if not entry:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("Expiró", callback_data="noop|x")]])
+
+    items = entry["items"]
+    total = len(items)
+    pages = max(1, (total + SETLIST_PAGE_SIZE - 1) // SETLIST_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * SETLIST_PAGE_SIZE
+    chunk = items[start:start + SETLIST_PAGE_SIZE]
+
+    botones: list[list[InlineKeyboardButton]] = []
+
+    # Cabecera: enlace a la página original del setlist
+    url = (entry.get("meta") or {}).get("url")
+    if url:
+        botones.append([InlineKeyboardButton("📄 Ver en setlist.fm", url=url)])
+
+    # Canciones de la página actual
+    for i, it in enumerate(chunk, start=start + 1):
+        title = _format_song_label(i, it.get("title") or "", it.get("cover"))
+        # Fila etiqueta (no clickeable)
+        botones.append([InlineKeyboardButton(title[:64], callback_data=f"noop|{key}")])
+
+        links = it.get("links") or {}
+        page_url = it.get("page_url")
+
+        # Botones de plataformas (Spotify | YouTube(/Music) | Apple) + ⋯
+        fila = []
+        if "spotify" in links and (links["spotify"].get("url")):
+            fila.append(InlineKeyboardButton("Espotifai", url=links["spotify"]["url"]))
+        yk = _pick_youtube_key(links)
+        if yk and links.get(yk, {}).get("url"):
+            fila.append(InlineKeyboardButton(nice_name(yk), url=links[yk]["url"]))
+        if "applemusic" in links and (links["applemusic"].get("url")):
+            fila.append(InlineKeyboardButton("Manzanita", url=links["applemusic"]["url"]))
+
+        # ⋯ Más (smart link) o búsqueda como fallback
+        if page_url:
+            fila.append(InlineKeyboardButton("⋯ Más", url=page_url))
+        else:
+            q = quote_plus(f"{(entry['meta'] or {}).get('artist','')} {it.get('title','')}".strip())
+            fila.append(InlineKeyboardButton("⋯ Buscar", url=f"https://song.link/search?q={q}"))
+
+        if fila:
+            botones.append(fila)
+
+    # Navegación
+    if pages > 1:
+        prev_page = max(0, page - 1)
+        next_page = min(pages - 1, page + 1)
+        botones.append([
+            InlineKeyboardButton("◀", callback_data=f"slp|{key}|{prev_page}"),
+            InlineKeyboardButton(f"Página {page+1}/{pages}", callback_data=f"noop|{key}"),
+            InlineKeyboardButton("▶", callback_data=f"slp|{key}|{next_page}"),
+        ])
+
+    return InlineKeyboardMarkup(botones)
+
+async def handle_setlist(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
+    setlist_id = _extract_setlist_id(url)
+    if not setlist_id:
+        await update.message.reply_text("No pude leer el ID del setlist en esa URL.")
+        return
+    if not SETLIST_FM_API_KEY:
+        await update.message.reply_text("Falta SETLIST_FM_API_KEY en el entorno para usar setlist.fm.")
+        return
+
+    # Cache
+    cached = SETLIST_CACHE.get(setlist_id)
+    if not cached:
+        js = await fetch_setlist_json(setlist_id)
+        if not js:
+            await update.message.reply_text("No pude obtener ese setlist (API). Intenta más tarde.")
+            return
+        meta, songs_raw = parse_setlist_songs(js)
+        # Filtrar intros/tapes/outros
+        songs_raw = [s for s in songs_raw if not s.get("is_tape")]
+        cached = {"meta": meta, "songs_raw": songs_raw}
+        SETLIST_CACHE[setlist_id] = cached
+
+    artist_show = (cached["meta"] or {}).get("artist") or ""
+    songs_raw = cached["songs_raw"]
+
+    # Resolver plataformas por canción (concurrencia limitada)
+    sem = asyncio.Semaphore(SETLIST_MAX_CONCURRENCY)
+    resolved: list[dict] = []
+
+    async def _resolve_one(s):
+        title = s.get("title") or ""
+        cover = s.get("cover")
+        async with sem:
+            links, page_url = await resolve_song_links(artist_show, title)
+        resolved.append({"title": title, "cover": cover, "links": links or {}, "page_url": page_url})
+
+    await asyncio.gather(*[_resolve_one(s) for s in songs_raw])
+
+    # Guardar y responder
+    key = remember_setlist(setlist_id, cached["meta"], resolved)
+
+    meta = cached["meta"] or {}
+    cap_parts = []
+    if meta.get("artist"):
+        cap_parts.append(f"🎤 {meta['artist']}")
+    venue_city = " — ".join([x for x in [meta.get("venue"), meta.get("city")] if x])
+    if venue_city:
+        cap_parts.append(venue_city)
+    if meta.get("eventDate"):
+        cap_parts.append(meta["eventDate"])
+    header = " | ".join(cap_parts) if cap_parts else "Setlist"
+
+    caption = f"{header}\n📃 {len(resolved)} canciones\n\nSelecciona una canción y elige plataforma:"
+    keyboard = build_setlist_keyboard(key, page=0)
+
+    await update.message.reply_text(caption, reply_markup=keyboard)
 
 # -------- Chat handler --------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    urls = find_urls(update.message.text if update.message else "")
+    text = update.message.text if update.message else ""
+    urls = find_urls(text)
     if not urls:
         return
     for url in urls:
-        if not is_music_url(url):
+        # 0) ¿Es un setlist?
+        if is_setlist_url(url):
+            await handle_setlist(update, context, url)
             continue
 
         # 1) ¿Es ARTISTA?
-        artist = await detect_artist(url)
-        if artist:
-            name = artist["name"]
-            caption = f"🧑‍🎤 {name}\n🔎 Búscalo en:"
-            kb = build_artist_search_keyboard(name)
-            await update.message.reply_text(caption, reply_markup=kb)
-            continue
-
-        # 2) Si no es artista, tratamos como canción/álbum (Odesli)
-        links, title, artist_name, cover = await fetch_odesli(url)
-        if not links:
-            continue
-
-        album_buttons = await derive_album_buttons_all(links)
-        key = remember_links(links, album_buttons)
-        keyboard = build_keyboard(links, show_all=False, key=key, album_buttons=album_buttons)
-
-        caption = "🎶 Disponible en:"
-        if title and artist_name:
-            caption = f"🎵 {title} — {artist_name}\n🎶 Disponible en:"
-        elif title:
-            caption = f"🎵 {title}\n🎶 Disponible en:"
-
-        if cover:
-            try:
-                await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=cover,
-                    caption=caption,
-                    reply_markup=keyboard
-                )
+        if is_music_url(url):
+            artist = await detect_artist(url)
+            if artist:
+                name = artist["name"]
+                caption = f"🧑‍🎤 {name}\n🔎 Búscalo en:"
+                kb = build_artist_search_keyboard(name)
+                await update.message.reply_text(caption, reply_markup=kb)
                 continue
-            except Exception as e:
-                log.info(f"No pude usar la portada, envío texto. {e}")
 
-        await update.message.reply_text(caption, reply_markup=keyboard)
+            # 2) Si no es artista, tratamos como canción/álbum (Odesli)
+            links, title, artist_name, cover, _page = await fetch_odesli(url)
+            if not links:
+                continue
+
+            album_buttons = await derive_album_buttons_all(links)
+            key = remember_links(links, album_buttons)
+            keyboard = build_keyboard(links, show_all=False, key=key, album_buttons=album_buttons)
+
+            caption = "🎶 Disponible en:"
+            if title and artist_name:
+                caption = f"🎵 {title} — {artist_name}\n🎶 Disponible en:"
+            elif title:
+                caption = f"🎵 {title}\n🎶 Disponible en:"
+
+            if cover:
+                try:
+                    await context.bot.send_photo(
+                        chat_id=update.effective_chat.id,
+                        photo=cover,
+                        caption=caption,
+                        reply_markup=keyboard
+                    )
+                    continue
+                except Exception as e:
+                    log.info(f"No pude usar la portada, envío texto. {e}")
+
+            await update.message.reply_text(caption, reply_markup=keyboard)
 
 # -------- Inline mode --------
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -436,6 +724,12 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     url = urls[0]
+
+    # SETLIST en modo inline (opcional: aquí solo ignoramos por simplicidad)
+    if is_setlist_url(url):
+        await update.inline_query.answer([], cache_time=10, is_personal=True)
+        return
+
     if not is_music_url(url):
         await update.inline_query.answer([], cache_time=10, is_personal=True)
         return
@@ -456,7 +750,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # Canción/álbum (Odesli) en inline
-    links, title, artist_name, cover = await fetch_odesli(url)
+    links, title, artist_name, cover, _page = await fetch_odesli(url)
     if not links:
         await update.inline_query.answer([], cache_time=5, is_personal=True)
         return
@@ -492,6 +786,32 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = cq.data or ""
     if data.startswith("noop|"):
         return
+
+    # Paginación de setlist
+    if data.startswith("slp|"):
+        _, key, page_s = data.split("|", 3)
+        try:
+            page = int(page_s)
+        except Exception:
+            page = 0
+        keyboard = build_setlist_keyboard(key, page=page)
+        try:
+            if cq.inline_message_id:
+                await context.bot.edit_message_reply_markup(
+                    inline_message_id=cq.inline_message_id,
+                    reply_markup=keyboard
+                )
+            else:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=cq.message.chat_id,
+                    message_id=cq.message.message_id,
+                    reply_markup=keyboard
+                )
+        except Exception as e:
+            log.warning(f"No pude editar teclado (setlist): {e}")
+        return
+
+    # Expandir/colapsar (modo canciones individuales)
     if not (data.startswith("more|") or data.startswith("less|")):
         return
     _, key = data.split("|", 1)
