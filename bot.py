@@ -4,6 +4,7 @@ import re
 import uuid
 import logging
 import asyncio
+import unicodedata
 from collections import deque
 from urllib.parse import (
     urlparse, urlunparse, parse_qs, quote, unquote, quote_plus
@@ -340,17 +341,31 @@ def remember_links(links: dict, album_buttons: list[tuple[str, str]]) -> str:
 
 # >>>>>>>>>>>>>>>>> NUEVO: helpers para letras <<<<<<<<<<<<<<<<<<
 
+def _normalize_unicode(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\u2014", " ").replace("\u2013", " ").replace("—", " ").replace("–", " ")
+    s = s.replace("“", '"').replace("”", '"').replace("’", "'")
+    return " ".join(s.split())
+
 def _clean_title(title: str) -> str:
-    t = re.sub(r'\s*\(feat[^\)]*\)', '', title, flags=re.I)
-    t = re.sub(r'\s*-\s*(official|audio|video|lyrics|lyric|remastered?|live.*)$', '', t, flags=re.I)
-    t = re.sub(r'\s*\[[^\]]*\]$', '', t)
-    return (t or "").strip()
+    t = _normalize_unicode(title or "")
+    t = re.sub(r'\s*\(feat[^\)]*\)', '', t, flags=re.I)
+    t = re.sub(r'\s*-\s*(official|audio|video|lyrics?|remastered?|live.*)$', '', t, flags=re.I)
+    t = re.sub(r'\s*\[[^\]]*\]\s*$', '', t)
+    return t.strip()
+
+def _clean_artist(artist: str) -> str:
+    a = _normalize_unicode(artist or "")
+    a = re.split(r'[,&/]|feat\.?', a, flags=re.I)[0]
+    return a.strip()
 
 async def _musixmatch_share_url(artist: str, title: str) -> str | None:
     if not MUSIXMATCH_KEY:
         return None
-    q_artist = (artist or "").strip()
-    q_title = (title or "").strip()
+    q_artist = _clean_artist(artist or "")
+    q_title = _clean_title(title or "")
     if not q_title:
         return None
     try:
@@ -362,6 +377,7 @@ async def _musixmatch_share_url(artist: str, title: str) -> str | None:
                     "q_artist": q_artist,
                     "page_size": 1,
                     "s_track_rating": "desc",
+                    "f_has_lyrics": 1,  # sólo tracks con letra
                     "apikey": MUSIXMATCH_KEY,
                 },
             )
@@ -378,44 +394,48 @@ async def _musixmatch_share_url(artist: str, title: str) -> str | None:
         return None
 
 async def _lyricscom_link(artist: str, title: str) -> str | None:
-    if not (STANDS4_UID and STANDS4_TOKENID):
-        return None
-    q_artist = (artist or "").strip()
-    q_title = (title or "").strip()
+    q_artist = _clean_artist(artist or "")
+    q_title = _clean_title(title or "")
     if not q_title:
         return None
-    base = "https://www.stands4.com/services/v2/lyrics.php"
-    params = {
-        "uid": STANDS4_UID,
-        "tokenid": STANDS4_TOKENID,
-        "term": q_title,
-        "artist": q_artist,
-        "format": "json",
-    }
+
+    # 1) Intento API STANDS4: song-link directo
+    if STANDS4_UID and STANDS4_TOKENID:
+        base = "https://www.stands4.com/services/v2/lyrics.php"
+        params = {
+            "uid": STANDS4_UID,
+            "tokenid": STANDS4_TOKENID,
+            "term": q_title,
+            "artist": q_artist,
+            "format": "json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(base, params=params)
+            j = r.json() or {}
+            results = j.get("result") or []
+            if isinstance(results, list) and results:
+                hit = results[0]
+                link = (hit or {}).get("song-link")
+                if link:
+                    return link
+        except Exception:
+            pass
+
+    # 2) Fallback: página de búsqueda pública (con verificación ligera)
+    search_q = quote_plus(f"{q_title} {q_artist}".strip())
+    search_url = f"https://www.lyrics.com/lyrics/{search_q}"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(base, params=params)
-        j = r.json() or {}
-        results = j.get("result") or []
-        if not isinstance(results, list) or not results:
-            clean = _clean_title(q_title)
-            if clean and clean != q_title:
-                return await _lyricscom_link(q_artist, clean)
-            return None
-        hit = results[0]
-        link = (hit or {}).get("song-link")
-        hit_title = _clean_title((hit or {}).get("song") or "").lower()
-        hit_artist = ((hit or {}).get("artist") or "").lower()
-        if link:
-            qt = _clean_title(q_title).lower()
-            if hit_title in qt or qt in hit_title:
-                # Validación simple también por artista (suave)
-                if not q_artist or q_artist.lower().split("&")[0].split(",")[0] in hit_artist:
-                    return link
-            return link  # si no es exacto, igual servirá como enlace directo
-        return None
+            r = await client.get(search_url, headers={"User-Agent": "Mozilla/5.0"})
+        html = (r.text or "").lower()
+        # Heurística simple: aparece el artista o el título en HTML
+        if (q_artist and q_artist.lower() in html) or (q_title and q_title.lower() in html):
+            return search_url
     except Exception:
         return None
+
+    return None
 
 async def get_lyrics_links(artist: str | None, title: str | None) -> dict | None:
     """
@@ -791,7 +811,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             artist = await detect_artist(url)
             if artist:
                 name = artist["name"]
-                caption = f"🧑‍🎤 {name}\n🔎 Búscalo en:"
+                caption = f"🧑‍🎤 {name}\n🔎 Búsalo en:"
                 kb = build_artist_search_keyboard(name)
                 await update.message.reply_text(caption, reply_markup=kb)
                 continue
@@ -801,8 +821,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not links:
                 continue
 
-            # NUEVO: calcular enlaces de letras (solo si hay título/artista)
-            lyrics_links = await get_lyrics_links(artist_name, title)
+            # NUEVO: calcular enlaces de letras (normalizados)
+            lyrics_links = await get_lyrics_links(_clean_artist(artist_name or ""), _clean_title(title or ""))
 
             album_buttons = await derive_album_buttons_all(links)
             key = remember_links(links, album_buttons)
@@ -853,7 +873,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     artist = await detect_artist(url)
     if artist:
         name = artist["name"]
-        caption = f"🧑‍🎤 {name}\n🔎 Búscalo en:"
+        caption = f"🧑‍🎤 {name}\n🔎 Búsalo en:"
         kb = build_artist_search_keyboard(name)
         rid = str(uuid.uuid4())
         results = [InlineQueryResultArticle(
@@ -870,8 +890,8 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.inline_query.answer([], cache_time=5, is_personal=True)
         return
 
-    # NUEVO: enlaces de letras
-    lyrics_links = await get_lyrics_links(artist_name, title)
+    # NUEVO: enlaces de letras (normalizados)
+    lyrics_links = await get_lyrics_links(_clean_artist(artist_name or ""), _clean_title(title or ""))
 
     album_buttons = await derive_album_buttons_all(links)
     key = remember_links(links, album_buttons)
