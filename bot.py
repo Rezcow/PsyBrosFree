@@ -31,6 +31,11 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 COUNTRY = os.environ.get("ODESLI_COUNTRY", "CL").upper()
 PORT = int(os.environ.get("PORT", "8000"))  # Render provee PORT
 
+# Nuevo: API keys para letras
+MUSIXMATCH_KEY = os.environ.get("MUSIXMATCH_KEY", "").strip()
+STANDS4_UID = os.environ.get("STANDS4_UID", "").strip()
+STANDS4_TOKENID = os.environ.get("STANDS4_TOKENID", "").strip()
+
 # Nuevo: API key de setlist.fm
 SETLIST_FM_API_KEY = os.environ.get("SETLIST_FM_API_KEY", "").strip()
 SETLIST_PAGE_SIZE = int(os.environ.get("SETLIST_PAGE_SIZE", "10"))
@@ -333,7 +338,102 @@ def remember_links(links: dict, album_buttons: list[tuple[str, str]]) -> str:
         STORE.pop(old, None)
     return key
 
-def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+# >>>>>>>>>>>>>>>>> NUEVO: helpers para letras <<<<<<<<<<<<<<<<<<
+
+def _clean_title(title: str) -> str:
+    t = re.sub(r'\s*\(feat[^\)]*\)', '', title, flags=re.I)
+    t = re.sub(r'\s*-\s*(official|audio|video|lyrics|lyric|remastered?|live.*)$', '', t, flags=re.I)
+    t = re.sub(r'\s*\[[^\]]*\]$', '', t)
+    return (t or "").strip()
+
+async def _musixmatch_share_url(artist: str, title: str) -> str | None:
+    if not MUSIXMATCH_KEY:
+        return None
+    q_artist = (artist or "").strip()
+    q_title = (title or "").strip()
+    if not q_title:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://api.musixmatch.com/ws/1.1/track.search",
+                params={
+                    "q_track": q_title,
+                    "q_artist": q_artist,
+                    "page_size": 1,
+                    "s_track_rating": "desc",
+                    "apikey": MUSIXMATCH_KEY,
+                },
+            )
+        data = r.json()
+        track_list = (data.get("message", {}).get("body", {}) or {}).get("track_list", [])
+        if not track_list:
+            clean = _clean_title(q_title)
+            if clean and clean != q_title:
+                return await _musixmatch_share_url(q_artist, clean)
+            return None
+        track = track_list[0].get("track") or {}
+        return track.get("track_share_url") or None
+    except Exception:
+        return None
+
+async def _lyricscom_link(artist: str, title: str) -> str | None:
+    if not (STANDS4_UID and STANDS4_TOKENID):
+        return None
+    q_artist = (artist or "").strip()
+    q_title = (title or "").strip()
+    if not q_title:
+        return None
+    base = "https://www.stands4.com/services/v2/lyrics.php"
+    params = {
+        "uid": STANDS4_UID,
+        "tokenid": STANDS4_TOKENID,
+        "term": q_title,
+        "artist": q_artist,
+        "format": "json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(base, params=params)
+        j = r.json() or {}
+        results = j.get("result") or []
+        if not isinstance(results, list) or not results:
+            clean = _clean_title(q_title)
+            if clean and clean != q_title:
+                return await _lyricscom_link(q_artist, clean)
+            return None
+        hit = results[0]
+        link = (hit or {}).get("song-link")
+        hit_title = _clean_title((hit or {}).get("song") or "").lower()
+        hit_artist = ((hit or {}).get("artist") or "").lower()
+        if link:
+            qt = _clean_title(q_title).lower()
+            if hit_title in qt or qt in hit_title:
+                # Validación simple también por artista (suave)
+                if not q_artist or q_artist.lower().split("&")[0].split(",")[0] in hit_artist:
+                    return link
+            return link  # si no es exacto, igual servirá como enlace directo
+        return None
+    except Exception:
+        return None
+
+async def get_lyrics_links(artist: str | None, title: str | None) -> dict | None:
+    """
+    Devuelve dict con enlaces presentes solo si hay match en al menos uno:
+      {"lyricscom": <url>|None, "musixmatch": <url>|None}
+    Si ninguno existe, retorna None (para que el caller no muestre botones).
+    """
+    if not title:
+        return None
+    mm = await _musixmatch_share_url(artist or "", title)
+    lc = await _lyricscom_link(artist or "", title)
+    if mm or lc:
+        return {"lyricscom": lc, "musixmatch": mm}
+    return None
+
+# <<<<<<<<<<<<<<<<<<<< fin helpers letras <<<<<<<<<<<<<<<<<<<<
+
+def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tuple[str, str]], lyrics_links: dict | None = None) -> InlineKeyboardMarkup:
     sorted_keys = sort_keys(links)
     fav_set = set(FAVS_LOWER)
     keys_to_show = sorted_keys if show_all else [k for k in sorted_keys if k.lower() in fav_set]
@@ -352,6 +452,16 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
             botones.append(fila); fila = []
     if fila:
         botones.append(fila)
+
+    # 1.5) Letras (solo si hay match en Lyrics.com o Musixmatch)
+    if lyrics_links:
+        lyr_row = []
+        if lyrics_links.get("lyricscom"):
+            lyr_row.append(InlineKeyboardButton("📝 Lyrics.com", url=lyrics_links["lyricscom"]))
+        if lyrics_links.get("musixmatch"):
+            lyr_row.append(InlineKeyboardButton("🎼 Musixmatch", url=lyrics_links["musixmatch"]))
+        if lyr_row:
+            botones.append(lyr_row)
 
     # 2) Álbum
     if album_buttons:
@@ -691,9 +801,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not links:
                 continue
 
+            # NUEVO: calcular enlaces de letras (solo si hay título/artista)
+            lyrics_links = await get_lyrics_links(artist_name, title)
+
             album_buttons = await derive_album_buttons_all(links)
             key = remember_links(links, album_buttons)
-            keyboard = build_keyboard(links, show_all=False, key=key, album_buttons=album_buttons)
+            keyboard = build_keyboard(
+                links, show_all=False, key=key, album_buttons=album_buttons, lyrics_links=lyrics_links
+            )
 
             caption = "🎶 Disponible en:"
             if title and artist_name:
@@ -755,9 +870,14 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.inline_query.answer([], cache_time=5, is_personal=True)
         return
 
+    # NUEVO: enlaces de letras
+    lyrics_links = await get_lyrics_links(artist_name, title)
+
     album_buttons = await derive_album_buttons_all(links)
     key = remember_links(links, album_buttons)
-    keyboard = build_keyboard(links, show_all=False, key=key, album_buttons=album_buttons)
+    keyboard = build_keyboard(
+        links, show_all=False, key=key, album_buttons=album_buttons, lyrics_links=lyrics_links
+    )
 
     caption = "🎶 Disponible en:"
     if title and artist_name:
@@ -822,7 +942,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     links = entry["links"]
     album_buttons = entry.get("albums", [])
     show_all = data.startswith("more|")
-    keyboard = build_keyboard(links, show_all=show_all, key=key, album_buttons=album_buttons)
+
+    # Nota: los botones de letras se calculan durante la creación inicial del teclado
+    # y no se guardan; para simplicidad no se recalculan en expandir/colapsar.
+    keyboard = build_keyboard(links, show_all=show_all, key=key, album_buttons=album_buttons, lyrics_links=None)
 
     try:
         if cq.inline_message_id:
