@@ -393,13 +393,14 @@ async def _musixmatch_share_url(artist: str, title: str) -> str | None:
     except Exception:
         return None
 
+# >>>>>>>>>> FUNCIÓN SUSTITUIDA: ahora encuentra link directo en Lyrics.com <<<<<<<<<
 async def _lyricscom_link(artist: str, title: str) -> str | None:
     q_artist = _clean_artist(artist or "")
-    q_title = _clean_title(title or "")
+    q_title  = _clean_title(title or "")
     if not q_title:
         return None
 
-    # 1) Intento API STANDS4: song-link directo
+    # 1) Intento con API STANDS4 (si hay credenciales): devuelve link directo si existe
     if STANDS4_UID and STANDS4_TOKENID:
         base = "https://www.stands4.com/services/v2/lyrics.php"
         params = {
@@ -415,27 +416,51 @@ async def _lyricscom_link(artist: str, title: str) -> str | None:
             j = r.json() or {}
             results = j.get("result") or []
             if isinstance(results, list) and results:
-                hit = results[0]
-                link = (hit or {}).get("song-link")
+                link = (results[0] or {}).get("song-link")
                 if link:
                     return link
         except Exception:
-            pass
+            pass  # si falla, seguimos al fallback
 
-    # 2) Fallback: página de búsqueda pública (con verificación ligera)
-    search_q = quote_plus(f"{q_title} {q_artist}".strip())
+    # 2) Fallback: buscar en Lyrics.com y extraer el PRIMER /lyric/... que encaje
+    search_q   = quote_plus(f"{q_title} {q_artist}".strip())
     search_url = f"https://www.lyrics.com/lyrics/{search_q}"
+
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(search_url, headers={"User-Agent": "Mozilla/5.0"})
-        html = (r.text or "").lower()
-        # Heurística simple: aparece el artista o el título en HTML
-        if (q_artist and q_artist.lower() in html) or (q_title and q_title.lower() in html):
-            return search_url
+        async with httpx.AsyncClient(timeout=12) as client:
+            r = await client.get(
+                search_url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; PsyBrosBot/1.0)"}
+            )
+        html = r.text or ""
+        html_low = html.lower()
+
+        # Candidatos tipo /lyric/12345678/...
+        candidates = list(re.finditer(r'href="(/lyric/\d+/[^"]+)"', html, flags=re.I))
+        if not candidates:
+            return None
+
+        qt = _clean_title(q_title).lower()
+        qa = q_artist.lower()
+
+        # 2.a) Preferir candidato cuyo contexto cercano contenga título (y artista si hay)
+        for m in candidates:
+            start = max(0, m.start() - 400)
+            end   = min(len(html), m.end() + 400)
+            ctx   = html_low[start:end]
+            title_ok  = qt and (qt in ctx)
+            artist_ok = (not qa) or (qa in ctx)
+            if title_ok and artist_ok:
+                return f"https://www.lyrics.com{m.group(1)}"
+
+        # 2.b) Menos estricto: si al menos el título aparece en la página, usa el primer candidato
+        if qt and (qt in html_low):
+            return f"https://www.lyrics.com{candidates[0].group(1)}"
+
+        return None
     except Exception:
         return None
-
-    return None
+# <<<<<<<<<<<<<<<<<<<< fin helpers letras <<<<<<<<<<<<<<<<<<<<
 
 async def get_lyrics_links(artist: str | None, title: str | None) -> dict | None:
     """
@@ -450,8 +475,6 @@ async def get_lyrics_links(artist: str | None, title: str | None) -> dict | None
     if mm or lc:
         return {"lyricscom": lc, "musixmatch": mm}
     return None
-
-# <<<<<<<<<<<<<<<<<<<< fin helpers letras <<<<<<<<<<<<<<<<<<<<
 
 def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tuple[str, str]], lyrics_links: dict | None = None) -> InlineKeyboardMarkup:
     sorted_keys = sort_keys(links)
