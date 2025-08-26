@@ -179,14 +179,12 @@ async def detect_artist(url: str) -> dict | None:
         p = urlparse(url)
         host = p.netloc.lower()
 
-        # Apple Music: /artist/{slug}/{id}
         if "music.apple.com" in host or "itunes.apple.com" in host:
             if "/artist/" in p.path.lower():
                 name = _apple_artist_slug_to_name(p.path)
                 if name:
                     return {"name": name, "platform": "apple"}
 
-        # Spotify: /artist/{id}
         if "spotify.com" in host and "/artist/" in p.path.lower():
             name = await _spotify_artist_name_from_oembed(url)
             if name:
@@ -337,11 +335,33 @@ def _normalize_unicode(s: str) -> str:
     s = s.replace("“", '"').replace("”", '"').replace("’", "'")
     return " ".join(s.split())
 
+def _norm_simple(s: str) -> str:
+    s = _normalize_unicode(s or "").lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    return " ".join(s.split())
+
 def _clean_title(title: str) -> str:
+    """
+    Limpia ruidos del título: ' - Live', ' - 2007 Remaster', '[Live]', '(feat ...)', etc.
+    """
     t = _normalize_unicode(title or "")
-    t = re.sub(r'\s*\(feat[^\)]*\)', '', t, flags=re.I)
-    t = re.sub(r'\s*-\s*(official|audio|video|lyrics?|remastered?|live.*)$', '', t, flags=re.I)
-    t = re.sub(r'\s*\[[^\]]*\]\s*$', '', t)
+
+    # Elimina "feat..."
+    t = re.sub(r"\s*\(feat[^\)]*\)", "", t, flags=re.I)
+
+    # Quita sufijos comunes (Live / Remaster / Acoustic / Version / Mix / Edit / etc.)
+    t = re.sub(r"\s*[-–—]\s*(live|remaster(ed)?|acoustic|demo|mono|stereo|version.*|edit.*|mix.*|radio edit|bonus track|clean|explicit)$",
+               "", t, flags=re.I)
+
+    # Quita etiquetas entre corchetes al final
+    t = re.sub(r"\s*\[[^\]]*\]\s*$", "", t)
+
+    # Otras etiquetas comerciales
+    t = re.sub(r"\s*[-–—]\s*(single|ep|album version.*)$", "", t, flags=re.I)
+
+    # Quita ' - Live at ...', ' (Live at ...)'
+    t = re.sub(r"\s*(\(|[-–—])\s*live\s+at\s+.*\)?$", "", t, flags=re.I)
+
     return t.strip()
 
 def _clean_artist(artist: str) -> str:
@@ -383,67 +403,77 @@ async def _musixmatch_share_url(artist: str, title: str) -> str | None:
 
 async def _lyricscom_link(artist: str, title: str) -> str | None:
     """
-    Devuelve el enlace DIRECTO de Lyrics.com a la letra:
-    https://www.lyrics.com/lyric/<id>/<Artist>/<Title>
-    Heurística: parsea la página de búsqueda y elige el mejor match.
+    Busca y devuelve el enlace DIRECTO /lyric/<id>/Artist/Title de Lyrics.com
+    usando heurística de coincidencia de título+artista.
     """
-    q_artist = _clean_artist(artist or "")
-    q_title  = _clean_title(title or "")
-    if not q_title:
+    want_artist = _norm_simple(artist or "")
+    want_title  = _norm_simple(title or "")
+    if not want_title:
         return None
 
-    def _norm(s: str) -> str:
-        s = _normalize_unicode(s or "").lower()
-        s = re.sub(r"[^a-z0-9\s]", " ", s)
-        return " ".join(s.split())
+    async def _search_and_pick(query: str) -> str | None:
+        url = f"https://www.lyrics.com/lyrics/{quote_plus(query)}"
+        try:
+            async with httpx.AsyncClient(timeout=12) as client:
+                r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            html = r.text or ""
+        except Exception:
+            return None
 
-    want_title  = _norm(q_title)
-    want_artist = _norm(q_artist)
-
-    # 1) Búsqueda pública y parseo de candidatos /lyric/<id>/<artist>/<title>
-    search_q  = quote_plus(f"{q_title} {q_artist}".strip())
-    search_url = f"https://www.lyrics.com/lyrics/{search_q}"
-
-    try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            r = await client.get(search_url, headers={"User-Agent": "Mozilla/5.0"})
-        html = r.text or ""
-        candidates = []
+        candidates: list[tuple[int, str]] = []
         for m in re.finditer(r'href="(/lyric/\d+/[^"]+)"', html, flags=re.I):
-            href = m.group(1)  # /lyric/19253843/Linkin+Park/Pushing+Me+Away
+            href = m.group(1)
             parts = href.split("/")
-            if len(parts) >= 5 and parts[1].lower() == "lyric":
-                slug_artist = _norm(unquote(parts[3]).replace("+", " "))
-                slug_title  = _norm(unquote(parts[4]).replace("+", " "))
+            if len(parts) < 5 or parts[1].lower() != "lyric":
+                continue
 
-                score = 0
-                if want_title and (want_title == slug_title or want_title in slug_title or slug_title in want_title):
-                    score += 2
-                if want_artist and (want_artist == slug_artist or want_artist in slug_artist or slug_artist in want_artist):
-                    score += 2
-                if want_title and want_title in _norm(unquote(href)):
-                    score += 1
+            slug_artist = _norm_simple(unquote(parts[3]).replace("+", " "))
+            slug_title  = _norm_simple(unquote(parts[4]).replace("+", " "))
 
+            score = 0
+            if want_title and slug_title == want_title:
+                score += 6
+            elif want_title and (want_title in slug_title or slug_title in want_title):
+                score += 3
+
+            if want_artist:
+                if slug_artist == want_artist:
+                    score += 6
+                elif want_artist in slug_artist or slug_artist in want_artist:
+                    score += 2
+
+            if want_title and want_title in _norm_simple(unquote(href)):
+                score += 1
+
+            if score > 0:
                 candidates.append((score, href))
 
-        if candidates:
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            best_score, best_href = candidates[0]
-            if best_score >= 2:
-                return f"https://www.lyrics.com{best_href}"
-    except Exception:
-        pass
+        if not candidates:
+            return None
 
-    # 2) Fallback: API STANDS4 (si está configurada)
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_href = candidates[0]
+        threshold = 6 if not want_artist else 8
+        if best_score >= threshold:
+            return f"https://www.lyrics.com{best_href}"
+        return None
+
+    # 1) "<título>" <artista>
+    q1 = f"\"{title}\" {artist}".strip()
+    link = await _search_and_pick(q1)
+    if link:
+        return link
+
+    # 2) Solo título
+    link = await _search_and_pick(title)
+    if link:
+        return link
+
+    # 3) Fallback STANDS4 (si está configurado)
     if STANDS4_UID and STANDS4_TOKENID:
         base = "https://www.stands4.com/services/v2/lyrics.php"
-        params = {
-            "uid": STANDS4_UID,
-            "tokenid": STANDS4_TOKENID,
-            "term": q_title,
-            "artist": q_artist,
-            "format": "json",
-        }
+        params = {"uid": STANDS4_UID, "tokenid": STANDS4_TOKENID,
+                  "term": title, "artist": artist, "format": "json"}
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.get(base, params=params)
@@ -494,7 +524,7 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
     if fila:
         botones.append(fila)
 
-    # 1.5) Letras (solo si hay match)
+    # 1.5) Letras (solo si hay match en Lyrics.com o Musixmatch)
     if lyrics_links:
         lyr_row = []
         if lyrics_links.get("lyricscom"):
@@ -600,7 +630,7 @@ def parse_setlist_songs(js: dict) -> tuple[dict, list[dict]]:
     venue = (js.get("venue") or {}).get("name")
     city = ((js.get("venue") or {}).get("city") or {}).get("name")
     country = (((js.get("venue") or {}).get("city") or {}).get("country") or {}).get("code")
-    event_date = js.get("eventDate")  # dd-mm-yyyy
+    event_date = js.get("eventDate")
     url = js.get("url") or ""
     sets = ((js.get("sets") or {}).get("set")) or []
     sets = _ensure_list(sets)
@@ -624,13 +654,7 @@ def parse_setlist_songs(js: dict) -> tuple[dict, list[dict]]:
 
 async def apple_search_track_url(artist: str, title: str) -> str | None:
     term = f"{artist} {title}".strip()
-    params = {
-        "term": term,
-        "entity": "song",
-        "limit": 1,
-        "country": COUNTRY,
-        "media": "music",
-    }
+    params = {"term": term, "entity": "song", "limit": 1, "country": COUNTRY, "media": "music"}
     url = "https://itunes.apple.com/search"
     try:
         async with httpx.AsyncClient() as client:
@@ -696,12 +720,10 @@ def build_setlist_keyboard(key: str, page: int) -> InlineKeyboardMarkup:
 
     botones: list[list[InlineKeyboardButton]] = []
 
-    # Cabecera: enlace a la página original del setlist
     url = (entry.get("meta") or {}).get("url")
     if url:
         botones.append([InlineKeyboardButton("📄 Ver en setlist.fm", url=url)])
 
-    # Canciones de la página actual
     for i, it in enumerate(chunk, start=start + 1):
         title = _format_song_label(i, it.get("title") or "", it.get("cover"))
         botones.append([InlineKeyboardButton(title[:64], callback_data=f"noop|{key}")])
@@ -818,7 +840,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not links:
                 continue
 
-            # Enlaces de letras (normalizados)
+            # Enlaces de letras (con limpieza de título/artist)
             lyrics_links = await get_lyrics_links(_clean_artist(artist_name or ""), _clean_title(title or ""))
 
             album_buttons = await derive_album_buttons_all(links)
@@ -920,7 +942,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("noop|"):
         return
 
-    # Paginación de setlist
     if data.startswith("slp|"):
         _, key, page_s = data.split("|", 3)
         try:
@@ -944,7 +965,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.warning(f"No pude editar teclado (setlist): {e}")
         return
 
-    # Expandir/colapsar (canción individual)
     if not (data.startswith("more|") or data.startswith("less|")):
         return
     _, key = data.split("|", 1)
@@ -956,7 +976,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     album_buttons = entry.get("albums", [])
     show_all = data.startswith("more|")
 
-    # Botones de letras no se recalculan aquí (se crean al inicio)
     keyboard = build_keyboard(links, show_all=show_all, key=key, album_buttons=album_buttons, lyrics_links=None)
 
     try:
@@ -997,20 +1016,17 @@ async def start_health_server():
     log.info(f"Health server listo en :{PORT}/healthz")
 
 async def main():
-    # Telegram app
     tg = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
     tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     tg.add_handler(InlineQueryHandler(handle_inline_query))
     tg.add_handler(CallbackQueryHandler(callbacks))
 
-    # Arranca health server y polling en paralelo
     await start_health_server()
     log.info("✅ Iniciando en modo POLLING…")
     await tg.initialize()
     await tg.start()
     await tg.updater.start_polling(drop_pending_updates=True)
 
-    # Mantener proceso vivo
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
