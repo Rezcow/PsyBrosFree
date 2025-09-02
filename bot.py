@@ -416,21 +416,66 @@ async def _ddg_first_result(site: str, artist: str, title: str) -> str | None:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(url, headers=headers)
         html = r.text or ""
-        # Enlaces típicos de resultados de DDG HTML:
-        # <a rel="nofollow" class="result__a" href="https://..."> ...
-        m = re.search(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"', html)
-        if not m:
-            # Fallback: algunos temas usan result__url
-            m = re.search(r'<a[^>]+class="result__url"[^>]+href="([^"]+)"', html)
+        m = re.search(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"', html) or \
+            re.search(r'<a[^>]+class="result__url"[^>]+href="([^"]+)"', html)
         if not m:
             return None
         link = m.group(1)
-        # Sencilla validación de dominio correcto
         if site not in link:
             return None
         return link
     except Exception:
         return None
+
+# --------- NUEVO: búsqueda de track Spotify (fallback) ----------
+async def ddg_spotify_track(artist: str, title: str) -> str | None:
+    """
+    Devuelve la primera URL que parezca un track de Spotify:
+    https://open.spotify.com/track/<id>
+    """
+    q_title = _clean_title(title or "")
+    q_artist = _clean_artist(artist or "")
+    if not q_title:
+        return None
+
+    # Buscamos SOLO /track/ (evita álbumes/artistas)
+    query = f'site:open.spotify.com/track "{q_title}" "{q_artist}"'
+    url = DDG_HTML.format(q=quote_plus(query))
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url, headers=headers)
+        html = r.text or ""
+        # Primer resultado
+        m = re.search(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"', html) or \
+            re.search(r'<a[^>]+class="result__url"[^>]+href="([^"]+)"', html)
+        if not m:
+            return None
+        link = m.group(1)
+        if "open.spotify.com/track/" not in link:
+            return None
+        # Limpieza mínima de parámetros
+        link = link.split("?")[0]
+        return link
+    except Exception as e:
+        log.debug(f"ddg_spotify_track error: {e}")
+        return None
+
+async def ensure_spotify_link(links: dict, artist: str | None, title: str | None) -> dict:
+    """
+    Si falta Spotify en links, intenta obtener un track URL y lo agrega.
+    """
+    if not links or "spotify" in links:
+        return links
+    if not title:
+        return links
+    try:
+        sp_url = await ddg_spotify_track(artist or "", title or "")
+        if sp_url:
+            links = {**links, "spotify": {"url": sp_url}}
+    except Exception as e:
+        log.debug(f"ensure_spotify_link fallo: {e}")
+    return links
 
 async def get_lyrics_links(artist: str | None, title: str | None) -> dict | None:
     """
@@ -495,7 +540,6 @@ def build_keyboard(links: dict, show_all: bool, key: str, album_buttons: list[tu
         if lyrics_links.get("genius"):
             lyr_row.append(InlineKeyboardButton("Genius", url=lyrics_links["genius"]))
         if lyr_row:
-            # Partimos en filas de 3 para no romper el layout
             for i in range(0, len(lyr_row), 3):
                 botones.append(lyr_row[i:i+3])
 
@@ -801,6 +845,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not links:
                 continue
 
+            # ---------- Fallback: asegurar Spotify si falta ----------
+            links = await ensure_spotify_link(links, artist_name or "", title or "")
+
             # Letras robustas (lyrics.com, musixmatch, letras, azlyrics, genius)
             lyrics_links = await get_lyrics_links(artist_name or "", title or "")
 
@@ -866,6 +913,9 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not links:
         await update.inline_query.answer([], cache_time=5, is_personal=True)
         return
+
+    # ---------- Fallback: asegurar Spotify si falta ----------
+    links = await ensure_spotify_link(links, artist_name or "", title or "")
 
     lyrics_links = await get_lyrics_links(artist_name or "", title or "")
 
