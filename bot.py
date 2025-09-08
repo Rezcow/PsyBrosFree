@@ -30,14 +30,14 @@ log = logging.getLogger("odesli-bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 COUNTRY = os.environ.get("ODESLI_COUNTRY", "CL").upper()
-PORT = int(os.environ.get("PORT", "8000"))  # Render provee PORT
+PORT = int(os.environ.get("PORT", "8000"))
 
-# API keys para letras (opcional STANDS4; Musixmatch recomendado)
+# API keys opcionales
 MUSIXMATCH_KEY = os.environ.get("MUSIXMATCH_KEY", "").strip()
 STANDS4_UID = os.environ.get("STANDS4_UID", "").strip()
 STANDS4_TOKENID = os.environ.get("STANDS4_TOKENID", "").strip()
 
-# API key de setlist.fm (opcional si usas setlists)
+# setlist.fm
 SETLIST_FM_API_KEY = os.environ.get("SETLIST_FM_API_KEY", "").strip()
 SETLIST_PAGE_SIZE = int(os.environ.get("SETLIST_PAGE_SIZE", "10"))
 SETLIST_MAX_CONCURRENCY = int(os.environ.get("SETLIST_MAX_CONCURRENCY", "5"))
@@ -66,7 +66,8 @@ def is_setlist_url(url: str) -> bool:
     try:
         p = urlparse(url)
         host = p.netloc.lower()
-        return SETLIST_DOMAIN in host and "/setlist/" in p.path.lower()
+        path = p.path.lower()
+        return "setlist.fm" in host and "/setlist/" in path
     except Exception:
         return False
 
@@ -129,14 +130,11 @@ def _regionalize_apple(url: str, for_album: bool = False) -> str:
         return url
 
 def normalize_links(raw_links: dict) -> dict:
-    out = {}
-    for k, info in raw_links.items():
-        out[k.lower()] = info
-    return out
+    return {k.lower(): v for k, v in (raw_links or {}).items()}
 
 def regionalize_links_for_track(links: dict) -> dict:
     out = {}
-    for k, info in links.items():
+    for k, info in (links or {}).items():
         url = info.get("url")
         if not url:
             continue
@@ -154,8 +152,7 @@ def _apple_artist_slug_to_name(path: str) -> str | None:
             if i + 1 < len(parts):
                 slug = unquote(parts[i + 1])
                 name = slug.replace("-", " ").strip()
-                if name:
-                    return name.title()
+                return name.title() if name else None
         except Exception:
             return None
     return None
@@ -216,7 +213,7 @@ async def _album_from_spotify(url: str):
         headers = {"User-Agent": "Mozilla/5.0"}
         async with httpx.AsyncClient() as client:
             r = await client.get(url, headers=headers, timeout=10)
-        m = re.search(r"open\.spotify\.com/album/([A-Za-z0-9]+)", r.text)
+        m = re.search(r"open\.spotify\.com/album/([A-Za-z0-9]+)", r.text or "")
         if m:
             return f"https://open.spotify.com/album/{m.group(1)}", None
     except Exception as e:
@@ -239,7 +236,7 @@ async def _ytm_album_from_page(url: str, prefer_music: bool = True):
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(url, headers=headers, timeout=12)
-        html = r.text
+        html = r.text or ""
         m = re.search(r'"playlistId":"(OLAK[^"]+)"', html) or re.search(r'list=(OLAK[^"&]+)', html)
         if m:
             pid = m.group(1)
@@ -268,7 +265,7 @@ async def derive_album_buttons_all(links: dict):
     buttons, seen = [], set()
     for key in ["applemusic","spotify","youtubemusic","youtube","soundcloud"]:
         if key not in links: continue
-        plat_url = links[key].get("url"); 
+        plat_url = links[key].get("url")
         if not plat_url: continue
         if key == "applemusic":
             album_url, _ = _album_from_apple(plat_url)
@@ -318,7 +315,7 @@ def _clean_artist(artist: str) -> str:
     a = re.split(r'[,&/]|feat\.?', a, flags=re.I)[0]
     return a.strip()
 
-# Musixmatch (no usado para ISRC ahora, pero lo dejamos para letras)
+# Musixmatch (para links)
 async def _musixmatch_share_url(artist: str, title: str) -> str | None:
     if not MUSIXMATCH_KEY: return None
     q_artist = _clean_artist(artist or ""); q_title = _clean_title(title or "")
@@ -335,7 +332,7 @@ async def _musixmatch_share_url(artist: str, title: str) -> str | None:
     except Exception:
         return None
 
-# Lyrics.com
+# Lyrics.com vía STANDS4 (si tienes credenciales)
 async def _lyricscom_link(artist: str, title: str) -> str | None:
     q_artist = _clean_artist(artist or ""); q_title = _clean_title(title or "")
     if not q_title: return None
@@ -390,9 +387,6 @@ async def _ddg_first_result(site: str, artist: str, title: str) -> str | None:
 
 # -------- Spotify helpers (nuevo: vía ISRC) --------
 async def apple_search_track(artist: str, title: str) -> tuple[str | None, str | None]:
-    """
-    Devuelve (trackViewUrl, isrc) usando la API pública de iTunes.
-    """
     term = f"{artist} {title}".strip()
     params = {"term": term, "entity": "song", "limit": 1, "country": COUNTRY, "media": "music"}
     url = "https://itunes.apple.com/search"
@@ -412,9 +406,6 @@ async def apple_search_track(artist: str, title: str) -> tuple[str | None, str |
         return None, None
 
 async def spotify_url_from_isrc(isrc: str) -> str | None:
-    """
-    Abre la búsqueda pública de Spotify con isrc:<ISRC> y extrae el primer track.
-    """
     if not isrc:
         return None
     search_url = f"https://open.spotify.com/search/{quote('isrc:'+isrc)}"
@@ -467,25 +458,17 @@ async def spotify_search_track_scrape(artist: str, title: str) -> str | None:
     return None
 
 async def ensure_spotify_link(links: dict, artist: str | None, title: str | None) -> dict:
-    """
-    Si falta Spotify, intenta: ISRC (iTunes) -> Spotify, luego DDG, luego scrape general.
-    """
-    if not links or "spotify" in links:
-        return links
-    if not title:
+    if not links or "spotify" in links or not title:
         return links
     try:
-        # 1) ISRC por iTunes
         _, isrc = await apple_search_track(artist or "", title or "")
         if isrc:
             sp = await spotify_url_from_isrc(isrc)
             if sp:
                 return {**links, "spotify": {"url": sp}}
-        # 2) DDG
         sp = await ddg_spotify_track(artist or "", title or "")
         if sp:
             return {**links, "spotify": {"url": sp}}
-        # 3) Scrape búsqueda genérica
         sp = await spotify_search_track_scrape(artist or "", title or "")
         if sp:
             return {**links, "spotify": {"url": sp}}
@@ -574,11 +557,48 @@ async def fetch_odesli(url: str):
 
 # ======== SETLIST.FM ========
 SETLIST_CACHE: dict[str, dict] = {}
+
+# Acepta IDs alfanuméricos 6–12, y extrae por estructura o por último "-ID" del segmento final
+ID_RE = re.compile(r"([0-9a-z]{6,12})$", re.I)
+
+def _extract_setlist_id_from_path(path: str) -> str | None:
+    last = path.rstrip("/").split("/")[-1]               # p.ej. deftones-...-3f4cdef.html
+    core = last.split(".html")[0]
+    if "-" in core:
+        cand = core.split("-")[-1]
+        if ID_RE.match(cand):
+            return cand.lower()
+    # fallback: si el último segmento ya es el id
+    m = ID_RE.search(core)
+    return m.group(1).lower() if m else None
+
+async def _extract_setlist_id_from_html(url: str) -> str | None:
+    headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "es,en;q=0.8"}
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, headers=headers, timeout=12)
+        if r.status_code != 200:
+            return None
+        html = r.text or ""
+        # 1) og:url canonical
+        m = re.search(r'property=["\']og:url["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+        if m:
+            canon = m.group(1)
+            pid = _extract_setlist_id_from_path(urlparse(canon).path)
+            if pid: return pid
+        # 2) cualquier href a /setlist/...-ID.html
+        m = re.search(r'/setlist/[^"\']*?-([0-9a-z]{6,12})\.html', html, re.I)
+        if m:
+            return m.group(1).lower()
+    except Exception as e:
+        log.debug(f"fetch html setlist fallback error: {e}")
+    return None
+
 def _extract_setlist_id(url: str) -> str | None:
     try:
         p = urlparse(url)
-        m = re.search(r"([0-9a-f]{8})(?:\.html)?$", p.path.lower())
-        return m.group(1) if m else None
+        pid = _extract_setlist_id_from_path(p.path)
+        return pid
     except Exception:
         return None
 
@@ -586,7 +606,7 @@ async def fetch_setlist_json(setlist_id: str) -> dict | None:
     if not SETLIST_FM_API_KEY:
         log.warning("Falta SETLIST_FM_API_KEY"); return None
     url = f"https://api.setlist.fm/rest/1.0/setlist/{setlist_id}"
-    headers = {"x-api-key": SETLIST_FM_API_KEY,"Accept": "application/json","Accept-Language": f"es-{COUNTRY},es;q=0.9,en;q=0.8","User-Agent": "setlist-resolver-bot/1.0"}
+    headers = {"x-api-key": SETLIST_FM_API_KEY,"Accept": "application/json","Accept-Language": f"es-{COUNTRY},es;q=0.9,en;q=0.8","User-Agent": "setlist-resolver-bot/1.1"}
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(url, headers=headers, timeout=15)
@@ -693,6 +713,9 @@ def build_setlist_keyboard(key: str, page: int) -> InlineKeyboardMarkup:
 async def handle_setlist(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     setlist_id = _extract_setlist_id(url)
     if not setlist_id:
+        # Fallback: abre el HTML y trata de deducir el ID (maneja casos como el tuyo)
+        setlist_id = await _extract_setlist_id_from_html(url)
+    if not setlist_id:
         await update.message.reply_text("No pude leer el ID del setlist en esa URL."); return
     if not SETLIST_FM_API_KEY:
         await update.message.reply_text("Falta SETLIST_FM_API_KEY en el entorno para usar setlist.fm."); return
@@ -755,9 +778,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             links, title, artist_name, cover, _page = await fetch_odesli(url)
             if not links: continue
 
-            # Asegurar Spotify si falta (ISRC -> Spotify; luego backups)
             links = await ensure_spotify_link(links, artist_name or "", title or "")
-
             lyrics_links = await get_lyrics_links(artist_name or "", title or "")
             album_buttons = await derive_album_buttons_all(links)
             key = remember_links(links, album_buttons)
@@ -802,9 +823,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not links:
         await update.inline_query.answer([], cache_time=5, is_personal=True); return
 
-    # Asegurar Spotify si falta
     links = await ensure_spotify_link(links, artist_name or "", title or "")
-
     lyrics_links = await get_lyrics_links(artist_name or "", title or "")
     album_buttons = await derive_album_buttons_all(links)
     key = remember_links(links, album_buttons)
