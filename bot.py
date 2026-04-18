@@ -387,6 +387,131 @@ def _spotify_entity_id(url: str) -> str | None:
     return None
 
 
+def _meta_content(html_text: str, prop: str) -> str | None:
+    patterns = [
+        rf"<meta[^>]+property=['\"]{re.escape(prop)}['\"][^>]+content=['\"]([^'\"]+)['\"]",
+        rf"<meta[^>]+content=['\"]([^'\"]+)['\"][^>]+property=['\"]{re.escape(prop)}['\"]",
+        rf"<meta[^>]+name=['\"]{re.escape(prop)}['\"][^>]+content=['\"]([^'\"]+)['\"]",
+        rf"<meta[^>]+content=['\"]([^'\"]+)['\"][^>]+name=['\"]{re.escape(prop)}['\"]",
+    ]
+    for pat in patterns:
+        m = re.search(pat, html_text, flags=re.I)
+        if m:
+            return html.unescape(m.group(1)).strip()
+    return None
+
+
+def _coerce_artist_name(v) -> str | None:
+    if not v:
+        return None
+    if isinstance(v, str):
+        return v.strip() or None
+    if isinstance(v, dict):
+        return str(v.get("name") or "").strip() or None
+    if isinstance(v, list):
+        names = []
+        for it in v:
+            name = _coerce_artist_name(it)
+            if name:
+                names.append(name)
+        if names:
+            return ", ".join(names)
+    return None
+
+
+def _jsonld_blocks(html_text: str) -> list[dict]:
+    out: list[dict] = []
+    for raw in re.findall(r"<script[^>]+type=['\"]application/ld\+json['\"][^>]*>(.*?)</script>", html_text, flags=re.I | re.S):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(html.unescape(raw))
+        except Exception:
+            continue
+        if isinstance(data, list):
+            out.extend([x for x in data if isinstance(x, dict)])
+        elif isinstance(data, dict):
+            if isinstance(data.get("@graph"), list):
+                out.extend([x for x in data["@graph"] if isinstance(x, dict)])
+            out.append(data)
+    return out
+
+
+async def _spotify_page_metadata(url: str) -> dict | None:
+    url = normalize_music_url(url)
+    cache_key = f"spotify_page_meta::{url}"
+    cached = ttl_get(SPOTIFY_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        client = get_http_client()
+        r = await client.get(url, timeout=12)
+        if r.status_code != 200:
+            ttl_set(SPOTIFY_CACHE, cache_key, None, 1800)
+            return None
+        html_text = r.text or ""
+    except Exception as e:
+        log.debug(f"spotify page fetch error: {e}")
+        ttl_set(SPOTIFY_CACHE, cache_key, None, 1800)
+        return None
+
+    meta = {
+        "kind": _spotify_kind_from_url(url),
+        "url": url,
+        "title": _meta_content(html_text, "og:title"),
+        "description": _meta_content(html_text, "og:description") or _meta_content(html_text, "description"),
+        "thumbnail": _meta_content(html_text, "og:image"),
+        "artist": None,
+        "album": None,
+        "owner": None,
+        "name": None,
+    }
+
+    for obj in _jsonld_blocks(html_text):
+        typ = str(obj.get("@type") or "").lower()
+        if typ == "musicrecording":
+            meta["kind"] = "track"
+            meta["name"] = obj.get("name") or meta["name"]
+            meta["artist"] = _coerce_artist_name(obj.get("byArtist")) or meta["artist"]
+            if isinstance(obj.get("inAlbum"), dict):
+                meta["album"] = obj["inAlbum"].get("name") or meta["album"]
+            meta["thumbnail"] = obj.get("image") or meta["thumbnail"]
+        elif typ == "musicalbum":
+            meta["kind"] = "album"
+            meta["name"] = obj.get("name") or meta["name"]
+            meta["artist"] = _coerce_artist_name(obj.get("byArtist")) or meta["artist"]
+            meta["thumbnail"] = obj.get("image") or meta["thumbnail"]
+        elif typ in {"musicgroup", "person", "performinggroup"}:
+            if meta.get("kind") == "artist" or "/artist/" in urlparse(url).path.lower():
+                meta["kind"] = "artist"
+                meta["artist"] = obj.get("name") or meta["artist"]
+                meta["name"] = obj.get("name") or meta["name"]
+                meta["thumbnail"] = obj.get("image") or meta["thumbnail"]
+        elif typ == "musicplaylist":
+            meta["kind"] = "playlist"
+            meta["name"] = obj.get("name") or meta["name"]
+            meta["owner"] = _coerce_artist_name(obj.get("creator")) or meta["owner"]
+            meta["thumbnail"] = obj.get("image") or meta["thumbnail"]
+
+    desc = meta.get("description") or ""
+    if desc and not meta.get("artist"):
+        parts = [x.strip() for x in desc.split("·") if x.strip()]
+        if meta["kind"] == "track" and len(parts) >= 2:
+            meta["artist"] = parts[1]
+        elif meta["kind"] == "album" and len(parts) >= 2:
+            meta["artist"] = parts[1]
+        elif meta["kind"] == "playlist" and len(parts) >= 1:
+            meta["owner"] = parts[0]
+
+    if not meta.get("name"):
+        meta["name"] = meta.get("title")
+
+    ttl_set(SPOTIFY_CACHE, cache_key, meta, SPOTIFY_CACHE_TTL)
+    return meta
+
+
 async def _spotify_embed_metadata(url: str) -> dict | None:
     cache_key = f"spotify_embed_meta::{normalize_music_url(url)}"
     cached = ttl_get(SPOTIFY_CACHE, cache_key)
@@ -537,6 +662,51 @@ async def _ddg_first_result(query: str, must_contain: str | None = None) -> str 
     except Exception as e:
         log.debug(f"DDG error: {e}")
     ttl_set(GENERIC_CACHE, cache_key, None, 1800)
+    return None
+
+
+async def _ddg_results(query: str) -> list[str]:
+    cache_key = f"ddg_results::{query}"
+    cached = ttl_get(GENERIC_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    out: list[str] = []
+    url = DDG_HTML.format(q=quote_plus(query))
+    try:
+        client = get_http_client()
+        r = await client.get(url, timeout=10)
+        html_text = r.text or ""
+        matches = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"', html_text)
+        seen = set()
+        for raw in matches:
+            link = decode_ddg_redirect(raw)
+            if link and link not in seen:
+                seen.add(link)
+                out.append(link)
+            if len(out) >= 8:
+                break
+    except Exception as e:
+        log.debug(f"DDG results error: {e}")
+    ttl_set(GENERIC_CACHE, cache_key, out, GENERIC_CACHE_TTL if out else 1800)
+    return out
+
+
+def _link_matches(link: str, must_any: list[str] | None = None, reject_any: list[str] | None = None) -> bool:
+    ll = (link or "").lower()
+    if must_any and not any(x.lower() in ll for x in must_any):
+        return False
+    if reject_any and any(x.lower() in ll for x in reject_any):
+        return False
+    return True
+
+
+async def _best_ddg_result(queries: list[str], must_any: list[str] | None = None, reject_any: list[str] | None = None) -> str | None:
+    for query in queries:
+        results = await _ddg_results(query)
+        for link in results:
+            if _link_matches(link, must_any=must_any, reject_any=reject_any):
+                return link
     return None
 
 
