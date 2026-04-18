@@ -497,7 +497,7 @@ async def _spotify_page_metadata(url: str) -> dict | None:
 
     desc = meta.get("description") or ""
     if desc and not meta.get("artist"):
-        parts = [x.strip() for x in desc.split("·") if x.strip()]
+        parts = [x.strip() for x in re.split(r"[·|•-]", desc) if x.strip()]
         if meta["kind"] == "track" and len(parts) >= 2:
             meta["artist"] = parts[1]
         elif meta["kind"] == "album" and len(parts) >= 2:
@@ -507,6 +507,24 @@ async def _spotify_page_metadata(url: str) -> dict | None:
 
     if not meta.get("name"):
         meta["name"] = meta.get("title")
+
+    # Fallback adicional desde og:title, típicamente: Song - song and lyrics by Artist | Spotify
+    ogt = _normalize_unicode(meta.get("title") or "")
+    if meta.get("kind") == "track":
+        m = re.match(r"^(.*?)\s+-\s+song and lyrics by\s+(.*?)\s*\|\s*Spotify$", ogt, flags=re.I)
+        if m:
+            if not meta.get("name"):
+                meta["name"] = m.group(1).strip()
+            if not meta.get("artist"):
+                meta["artist"] = m.group(2).strip()
+        # otro patrón: Track Name - Artist
+        if (not meta.get("artist") or not meta.get("name")) and " - " in ogt:
+            left, right = ogt.split(" - ", 1)
+            right = re.sub(r"\s*\|\s*Spotify.*$", "", right, flags=re.I).strip()
+            if not meta.get("name"):
+                meta["name"] = left.strip()
+            if not meta.get("artist") and right:
+                meta["artist"] = right
 
     ttl_set(SPOTIFY_CACHE, cache_key, meta, SPOTIFY_CACHE_TTL)
     return meta
@@ -778,7 +796,8 @@ async def build_spotify_track_links(meta: dict) -> tuple[dict, dict]:
     title = _clean_title(meta.get("name") or meta.get("title") or "")
     if not title:
         title = _clean_title(meta.get("title") or "")
-    query = quote_plus(" ".join(x for x in [artist, title] if x).strip())
+    search_terms = " ".join(x for x in [artist, title] if x).strip() or title or meta.get('title') or ''
+    query = quote_plus(search_terms)
 
     links: dict[str, dict] = {
         "spotify": {"url": meta["url"]},
@@ -793,11 +812,23 @@ async def build_spotify_track_links(meta: dict) -> tuple[dict, dict]:
         links["applemusic"] = {"url": apple_track}
 
     # A few optional direct enrichments if available
-    ddg_yt = await _ddg_first_result(f'site:youtube.com/watch "{title}" "{artist}"', must_contain="youtube.com/watch")
+    yt_queries = []
+    if artist and title:
+        yt_queries.append(f'site:youtube.com/watch "{title}" "{artist}"')
+        yt_queries.append(f'site:youtube.com/watch {artist} {title} official audio')
+    else:
+        yt_queries.append(f'site:youtube.com/watch "{title}"')
+    ddg_yt = await _best_ddg_result(yt_queries, must_any=["youtube.com/watch", "youtu.be/"])
     if ddg_yt:
         links["youtube"] = {"url": ddg_yt}
 
-    ddg_sc = await _ddg_first_result(f'site:soundcloud.com "{title}" "{artist}"', must_contain="soundcloud.com/")
+    sc_queries = []
+    if artist and title:
+        sc_queries.append(f'site:soundcloud.com "{title}" "{artist}"')
+        sc_queries.append(f'site:soundcloud.com {artist} {title}')
+    else:
+        sc_queries.append(f'site:soundcloud.com "{title}"')
+    ddg_sc = await _best_ddg_result(sc_queries, must_any=["soundcloud.com/"], reject_any=["/search", "/discover"])
     if ddg_sc:
         links["soundcloud"] = {"url": ddg_sc}
 
@@ -867,6 +898,40 @@ async def build_spotify_playlist_links(meta: dict) -> tuple[dict, dict]:
     return links, extra
 
 
+async def _spotify_best_metadata(url: str) -> dict | None:
+    """Combina oEmbed y metadata de la página. oEmbed es rápido, pero a veces
+    trae solo el título (ej. "1983"). La página suele traer artista/álbum."""
+    embed = await _spotify_embed_metadata(url)
+    page = await _spotify_page_metadata(url)
+
+    if not embed and not page:
+        return None
+
+    if not embed:
+        return page
+    if not page:
+        return embed
+
+    merged = dict(page)
+    # Prefiere datos más ricos de page, pero conserva url/id/author_name de embed
+    for k, v in embed.items():
+        if k not in merged or not merged.get(k):
+            merged[k] = v
+
+    # Si embed solo trae un título genérico y page tiene nombre/artista, úsalo
+    if not merged.get('artist') and page.get('artist'):
+        merged['artist'] = page.get('artist')
+    if (not merged.get('name') or merged.get('name') == merged.get('title')) and page.get('name'):
+        merged['name'] = page.get('name')
+    if not merged.get('thumbnail') and page.get('thumbnail'):
+        merged['thumbnail'] = page.get('thumbnail')
+    if not merged.get('album') and page.get('album'):
+        merged['album'] = page.get('album')
+    if not merged.get('owner') and page.get('owner'):
+        merged['owner'] = page.get('owner')
+    return merged
+
+
 async def resolve_spotify_native(url: str) -> tuple[dict | None, str | None, str | None, str | None, str | None, list[tuple[str, str]], dict | None]:
     """
     Returns:
@@ -878,7 +943,7 @@ async def resolve_spotify_native(url: str) -> tuple[dict | None, str | None, str
     if cached is not None:
         return cached
 
-    meta = await _spotify_embed_metadata(url)
+    meta = await _spotify_best_metadata(url)
     if not meta:
         result = (None, None, None, None, None, [], None)
         ttl_set(SPOTIFY_CACHE, cache_key, result, 900)
