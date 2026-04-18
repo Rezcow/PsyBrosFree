@@ -1,11 +1,12 @@
-# bot.py
 import os
 import re
 import uuid
+import html
+import json
+import time
 import logging
 import asyncio
 import unicodedata
-import time
 from collections import deque
 from urllib.parse import (
     urlparse, urlunparse, parse_qs, quote, unquote, quote_plus
@@ -27,7 +28,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("odesli-bot")
+log = logging.getLogger("psybros-bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 COUNTRY = os.environ.get("ODESLI_COUNTRY", "CL").upper()
@@ -43,13 +44,14 @@ SETLIST_FM_API_KEY = os.environ.get("SETLIST_FM_API_KEY", "").strip()
 SETLIST_PAGE_SIZE = int(os.environ.get("SETLIST_PAGE_SIZE", "10"))
 SETLIST_MAX_CONCURRENCY = int(os.environ.get("SETLIST_MAX_CONCURRENCY", "5"))
 
-# Rate limit / cache settings
-ODESLI_MAX_CONCURRENCY = int(os.environ.get("ODESLI_MAX_CONCURRENCY", "2"))
-ODESLI_MAX_RETRIES = int(os.environ.get("ODESLI_MAX_RETRIES", "4"))
+# Odesli now optional; keep very conservative settings
+ODESLI_MAX_CONCURRENCY = int(os.environ.get("ODESLI_MAX_CONCURRENCY", "1"))
+ODESLI_MAX_RETRIES = int(os.environ.get("ODESLI_MAX_RETRIES", "2"))
 ODESLI_CACHE_TTL = int(os.environ.get("ODESLI_CACHE_TTL", "21600"))  # 6 horas
 GENERIC_CACHE_TTL = int(os.environ.get("GENERIC_CACHE_TTL", "21600"))  # 6 horas
 LYRICS_CACHE_TTL = int(os.environ.get("LYRICS_CACHE_TTL", "43200"))  # 12 horas
 SETLIST_CACHE_TTL = int(os.environ.get("SETLIST_CACHE_TTL", "86400"))  # 24 horas
+SPOTIFY_CACHE_TTL = int(os.environ.get("SPOTIFY_CACHE_TTL", "21600"))
 
 # -------- Utils --------
 URL_RE = re.compile(r"https?://\S+")
@@ -64,8 +66,10 @@ MUSIC_DOMAINS = (
 )
 SETLIST_DOMAIN = "setlist.fm"
 
+
 def now_ts() -> float:
     return time.time()
+
 
 def ttl_get(cache: dict, key: str):
     item = cache.get(key)
@@ -77,8 +81,10 @@ def ttl_get(cache: dict, key: str):
         return None
     return value
 
+
 def ttl_set(cache: dict, key: str, value, ttl: int):
     cache[key] = (now_ts() + ttl, value)
+
 
 def is_music_url(url: str) -> bool:
     try:
@@ -86,6 +92,7 @@ def is_music_url(url: str) -> bool:
         return any(d in host for d in MUSIC_DOMAINS)
     except Exception:
         return False
+
 
 def is_setlist_url(url: str) -> bool:
     try:
@@ -95,6 +102,14 @@ def is_setlist_url(url: str) -> bool:
         return "setlist.fm" in host and "/setlist/" in path
     except Exception:
         return False
+
+
+def is_spotify_url(url: str) -> bool:
+    try:
+        return "spotify.com" in urlparse(url).netloc.lower()
+    except Exception:
+        return False
+
 
 def find_urls(text: str) -> list[str]:
     if not text:
@@ -106,6 +121,7 @@ def find_urls(text: str) -> list[str]:
             seen.add(u)
             out.append(u)
     return out
+
 
 def nice_name(key: str) -> str:
     k = key.lower()
@@ -128,7 +144,9 @@ def nice_name(key: str) -> str:
     }
     return mapping.get(k, key.capitalize())
 
+
 FAVS_LOWER = ["spotify", "youtube", "youtubemusic", "applemusic", "soundcloud"]
+
 
 def sort_keys(links: dict) -> list[str]:
     keys = list(links.keys())
@@ -137,6 +155,7 @@ def sort_keys(links: dict) -> list[str]:
     others = [k for k in keys if k.lower() not in set(FAVS_LOWER)]
     others_sorted = sorted(others, key=lambda x: nice_name(x.lower()))
     return fav_present + others_sorted
+
 
 def normalize_music_url(url: str) -> str:
     """
@@ -151,16 +170,14 @@ def normalize_music_url(url: str) -> str:
         fragment = ""
 
         if "spotify.com" in netloc.lower():
-            # Quitar prefijos /intl-es o /intl-en o /intl-es-es, etc.
             path = re.sub(r"^/intl-[a-z]{2}(?=/)", "", path, flags=re.I)
             path = re.sub(r"^/intl-[a-z]{2}-[a-z]{2}(?=/)", "", path, flags=re.I)
-
-            # Mantener solo partes relevantes; normalmente ningún query param es necesario
             return urlunparse((scheme, netloc, path, "", "", fragment))
 
         return urlunparse((scheme, netloc, path, p.params, p.query, fragment))
     except Exception:
         return url
+
 
 # ---- Regionalización Apple Music ----
 def _ensure_region_path(path: str) -> str:
@@ -170,20 +187,25 @@ def _ensure_region_path(path: str) -> str:
         return "/" + "/".join(parts)
     return f"/{COUNTRY.lower()}/{path.strip('/')}"
 
-def _regionalize_apple(url: str, for_album: bool = False) -> str:
+
+def _regionalize_apple(url: str | None, for_album: bool = False) -> str | None:
+    if not url:
+        return None
     try:
         p = urlparse(url)
         host = "music.apple.com"
         new_path = _ensure_region_path(p.path)
         if for_album:
-            return urlunparse((p.scheme, host, new_path, "", "", ""))
-        return urlunparse((p.scheme, host, new_path, p.params, p.query, p.fragment))
+            return urlunparse((p.scheme or "https", host, new_path, "", "", ""))
+        return urlunparse((p.scheme or "https", host, new_path, p.params, p.query, p.fragment))
     except Exception as e:
         log.debug(f"No pude regionalizar Apple Music: {e}")
         return url
 
+
 def normalize_links(raw_links: dict) -> dict:
     return {k.lower(): v for k, v in (raw_links or {}).items()}
+
 
 def regionalize_links_for_track(links: dict) -> dict:
     out = {}
@@ -196,20 +218,35 @@ def regionalize_links_for_track(links: dict) -> dict:
         out[k] = {**info, "url": url}
     return out
 
+
 # ====== HTTP CLIENT ======
 HTTP_CLIENT: httpx.AsyncClient | None = None
 ODESLI_SEM = asyncio.Semaphore(ODESLI_MAX_CONCURRENCY)
+ODESLI_LOCK = asyncio.Lock()
+_LAST_ODESLI_CALL = 0.0
+
 
 def get_http_client() -> httpx.AsyncClient:
     global HTTP_CLIENT
     if HTTP_CLIENT is None:
         limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
         headers = {
-            "User-Agent": "psybros-bot/1.0",
+            "User-Agent": "psybros-bot/2.0",
             "Accept-Language": f"es-{COUNTRY},es;q=0.9,en;q=0.8",
         }
         HTTP_CLIENT = httpx.AsyncClient(timeout=15, limits=limits, headers=headers, follow_redirects=True)
     return HTTP_CLIENT
+
+
+async def _throttle_odesli(min_gap: float = 1.2):
+    global _LAST_ODESLI_CALL
+    async with ODESLI_LOCK:
+        now = time.time()
+        delta = now - _LAST_ODESLI_CALL
+        if delta < min_gap:
+            await asyncio.sleep(min_gap - delta)
+        _LAST_ODESLI_CALL = time.time()
+
 
 # ====== ARTISTAS ======
 def _apple_artist_slug_to_name(path: str) -> str | None:
@@ -225,25 +262,41 @@ def _apple_artist_slug_to_name(path: str) -> str | None:
             return None
     return None
 
-async def _spotify_artist_name_from_oembed(url: str) -> str | None:
+
+async def _spotify_oembed(url: str) -> dict | None:
     cache_key = f"spotify_oembed::{normalize_music_url(url)}"
     cached = ttl_get(GENERIC_CACHE, cache_key)
     if cached is not None:
         return cached
 
-    oembed = f"https://open.spotify.com/oembed?url={quote(url, safe='')}"
+    oembed = f"https://open.spotify.com/oembed?url={quote(normalize_music_url(url), safe='')}"
     try:
         client = get_http_client()
         r = await client.get(oembed, timeout=10)
         if r.status_code == 200:
-            title = (r.json() or {}).get("title")
-            result = str(title).strip() if title else None
-            ttl_set(GENERIC_CACHE, cache_key, result, GENERIC_CACHE_TTL)
-            return result
+            data = r.json() or {}
+            ttl_set(GENERIC_CACHE, cache_key, data, GENERIC_CACHE_TTL)
+            return data
     except Exception as e:
         log.debug(f"Spotify oEmbed falló: {e}")
     ttl_set(GENERIC_CACHE, cache_key, None, 600)
     return None
+
+
+async def _spotify_artist_name_from_oembed(url: str) -> str | None:
+    data = await _spotify_oembed(url)
+    if not data:
+        return None
+    title = str(data.get("title") or "").strip()
+    author = str(data.get("author_name") or "").strip()
+    if author:
+        return author
+    if title and " - " in title:
+        left, right = title.split(" - ", 1)
+        # en algunos casos puede venir "Artist - Song"
+        return left.strip() if left.strip() else right.strip()
+    return title or None
+
 
 async def detect_artist(url: str) -> dict | None:
     try:
@@ -261,21 +314,452 @@ async def detect_artist(url: str) -> dict | None:
         log.debug(f"detect_artist error: {e}")
     return None
 
-def build_artist_search_keyboard(artist_name: str) -> InlineKeyboardMarkup:
-    q = quote(artist_name)
-    buttons = [
-        [
-            InlineKeyboardButton("Espotifai", url=f"https://open.spotify.com/search/{q}"),
-            InlineKeyboardButton("Yutú", url=f"https://www.youtube.com/results?search_query={q}"),
-            InlineKeyboardButton("Yutúmusic", url=f"https://music.youtube.com/search?q={q}"),
-        ],
-        [
-            InlineKeyboardButton("Manzanita", url=f"https://music.apple.com/{COUNTRY.lower()}/search?term={q}"),
-            InlineKeyboardButton("SounClou", url=f"https://soundcloud.com/search?q={q}"),
-            InlineKeyboardButton("Bandcamp", url=f"https://bandcamp.com/search?q={q}&item_type=b"),
-        ],
-    ]
-    return InlineKeyboardMarkup(buttons)
+
+# ====== SPOTIFY NATIVE RESOLVER ======
+SPOTIFY_CACHE: dict[str, tuple[float, object]] = {}
+
+
+def _normalize_unicode(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\u2014", " ").replace("\u2013", " ").replace("—", " ").replace("–", " ")
+    s = s.replace("“", '"').replace("”", '"').replace("’", "'")
+    return " ".join(s.split())
+
+
+def _clean_title(title: str) -> str:
+    t = _normalize_unicode(title or "")
+    t = re.sub(r'\s*\(feat[^\)]*\)', '', t, flags=re.I)
+    t = re.sub(r'\s*\(with[^\)]*\)', '', t, flags=re.I)
+    t = re.sub(r'\s*\[[^\]]*\]\s*$', '', t)
+    return t.strip(" -")
+
+
+def _clean_artist(artist: str) -> str:
+    a = _normalize_unicode(artist or "")
+    a = re.split(r'[,&/]|feat\.?', a, flags=re.I)[0]
+    return a.strip()
+
+
+def _spotify_kind_from_url(url: str) -> str:
+    p = urlparse(normalize_music_url(url))
+    path = p.path.lower()
+    if "/track/" in path:
+        return "track"
+    if "/album/" in path:
+        return "album"
+    if "/artist/" in path:
+        return "artist"
+    if "/playlist/" in path:
+        return "playlist"
+    return "unknown"
+
+
+def _split_spotify_title(title: str, author_name: str = "") -> tuple[str | None, str | None]:
+    title = _normalize_unicode(title or "")
+    author_name = _normalize_unicode(author_name or "")
+    if not title and not author_name:
+        return None, None
+
+    # prefer author_name if provided by oEmbed
+    if author_name:
+        artist = author_name.strip()
+        song = title.strip()
+        # algunos oEmbed devuelven "song" tal cual; otros mezclan
+        if " - " in song:
+            left, right = song.split(" - ", 1)
+            if left.strip().lower() == artist.strip().lower():
+                song = right.strip()
+        return artist or None, song or None
+
+    if " - " in title:
+        left, right = title.split(" - ", 1)
+        return left.strip() or None, right.strip() or None
+    return None, title.strip() or None
+
+
+def _spotify_entity_id(url: str) -> str | None:
+    p = urlparse(normalize_music_url(url))
+    parts = [x for x in p.path.split("/") if x]
+    if len(parts) >= 2:
+        return parts[-1]
+    return None
+
+
+async def _spotify_embed_metadata(url: str) -> dict | None:
+    cache_key = f"spotify_embed_meta::{normalize_music_url(url)}"
+    cached = ttl_get(SPOTIFY_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    entity_id = _spotify_entity_id(url)
+    kind = _spotify_kind_from_url(url)
+    data = await _spotify_oembed(url)
+    if not data:
+        ttl_set(SPOTIFY_CACHE, cache_key, None, 900)
+        return None
+
+    title = str(data.get("title") or "").strip()
+    author_name = str(data.get("author_name") or "").strip()
+    thumbnail = data.get("thumbnail_url") or data.get("thumbnailUrl")
+
+    artist, song_or_name = _split_spotify_title(title, author_name)
+
+    meta = {
+        "kind": kind,
+        "id": entity_id,
+        "url": normalize_music_url(url),
+        "title": title or song_or_name,
+        "artist": artist,
+        "name": song_or_name or title,
+        "thumbnail": thumbnail,
+        "author_name": author_name,
+    }
+    ttl_set(SPOTIFY_CACHE, cache_key, meta, SPOTIFY_CACHE_TTL)
+    return meta
+
+
+async def apple_search_track(artist: str, title: str) -> tuple[str | None, str | None, str | None]:
+    term = " ".join(x for x in [artist, title] if x).strip()
+    cache_key = f"apple_track::{COUNTRY}::{term.lower()}"
+    cached = ttl_get(GENERIC_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    params = {"term": term, "entity": "song", "limit": 1, "country": COUNTRY, "media": "music"}
+    url = "https://itunes.apple.com/search"
+    try:
+        client = get_http_client()
+        r = await client.get(url, params=params, timeout=12)
+        if r.status_code != 200:
+            ttl_set(GENERIC_CACHE, cache_key, (None, None, None), 1800)
+            return None, None, None
+        data = r.json() or {}
+        results = data.get("results") or []
+        if not results:
+            ttl_set(GENERIC_CACHE, cache_key, (None, None, None), 1800)
+            return None, None, None
+        it = results[0]
+        result = (_regionalize_apple(it.get("trackViewUrl"), for_album=False), it.get("isrc"), it.get("collectionViewUrl"))
+        ttl_set(GENERIC_CACHE, cache_key, result, GENERIC_CACHE_TTL)
+        return result
+    except Exception as e:
+        log.debug(f"Apple search falló para '{term}': {e}")
+        ttl_set(GENERIC_CACHE, cache_key, (None, None, None), 1800)
+        return None, None, None
+
+
+async def apple_search_album(artist: str, album: str) -> str | None:
+    term = " ".join(x for x in [artist, album] if x).strip()
+    cache_key = f"apple_album::{COUNTRY}::{term.lower()}"
+    cached = ttl_get(GENERIC_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    params = {"term": term, "entity": "album", "limit": 1, "country": COUNTRY, "media": "music"}
+    try:
+        client = get_http_client()
+        r = await client.get("https://itunes.apple.com/search", params=params, timeout=12)
+        if r.status_code == 200:
+            data = r.json() or {}
+            results = data.get("results") or []
+            if results:
+                out = _regionalize_apple(results[0].get("collectionViewUrl"), for_album=True)
+                ttl_set(GENERIC_CACHE, cache_key, out, GENERIC_CACHE_TTL)
+                return out
+    except Exception as e:
+        log.debug(f"apple_search_album error: {e}")
+    ttl_set(GENERIC_CACHE, cache_key, None, 1800)
+    return None
+
+
+async def apple_search_artist(artist: str) -> str | None:
+    term = artist.strip()
+    cache_key = f"apple_artist::{COUNTRY}::{term.lower()}"
+    cached = ttl_get(GENERIC_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    params = {"term": term, "entity": "musicArtist", "limit": 1, "country": COUNTRY, "media": "music"}
+    try:
+        client = get_http_client()
+        r = await client.get("https://itunes.apple.com/search", params=params, timeout=12)
+        if r.status_code == 200:
+            data = r.json() or {}
+            results = data.get("results") or []
+            if results:
+                out = _regionalize_apple(results[0].get("artistLinkUrl"), for_album=False)
+                ttl_set(GENERIC_CACHE, cache_key, out, GENERIC_CACHE_TTL)
+                return out
+    except Exception as e:
+        log.debug(f"apple_search_artist error: {e}")
+    ttl_set(GENERIC_CACHE, cache_key, None, 1800)
+    return None
+
+
+DDG_HTML = "https://duckduckgo.com/html/?q={q}"
+
+
+def decode_ddg_redirect(link: str) -> str:
+    try:
+        if not link:
+            return link
+        if link.startswith("/l/") or "duckduckgo.com/l/?" in link:
+            full = "https://duckduckgo.com" + link if link.startswith("/l/") else link
+            qs = parse_qs(urlparse(full).query)
+            target = qs.get("uddg") or qs.get("u") or []
+            if target:
+                return unquote(target[0])
+        return link
+    except Exception:
+        return link
+
+
+async def _ddg_first_result(query: str, must_contain: str | None = None) -> str | None:
+    cache_key = f"ddg_any::{query}::{must_contain or ''}"
+    cached = ttl_get(GENERIC_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    url = DDG_HTML.format(q=quote_plus(query))
+    try:
+        client = get_http_client()
+        r = await client.get(url, timeout=10)
+        html_text = r.text or ""
+        matches = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"', html_text)
+        for raw in matches:
+            link = decode_ddg_redirect(raw)
+            if must_contain and must_contain not in link:
+                continue
+            ttl_set(GENERIC_CACHE, cache_key, link, GENERIC_CACHE_TTL)
+            return link
+    except Exception as e:
+        log.debug(f"DDG error: {e}")
+    ttl_set(GENERIC_CACHE, cache_key, None, 1800)
+    return None
+
+
+async def spotify_url_from_isrc(isrc: str) -> str | None:
+    if not isrc:
+        return None
+
+    cache_key = f"spotify_isrc::{isrc}"
+    cached = ttl_get(GENERIC_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    search_url = f"https://open.spotify.com/search/{quote('isrc:' + isrc)}"
+    try:
+        client = get_http_client()
+        r = await client.get(search_url, timeout=12)
+        html_text = r.text or ""
+        m = re.search(r'open\.spotify\.com/track/([A-Za-z0-9]+)', html_text)
+        if m:
+            result = f"https://open.spotify.com/track/{m.group(1)}"
+            ttl_set(GENERIC_CACHE, cache_key, result, GENERIC_CACHE_TTL)
+            return result
+    except Exception as e:
+        log.debug(f"spotify_url_from_isrc error: {e}")
+
+    ttl_set(GENERIC_CACHE, cache_key, None, 1800)
+    return None
+
+
+async def ddg_spotify_track(artist: str, title: str) -> str | None:
+    q_title = _clean_title(title or "")
+    q_artist = _clean_artist(artist or "")
+    if not q_title:
+        return None
+
+    query = f'site:open.spotify.com/track "{q_title}" "{q_artist}"'
+    return await _ddg_first_result(query, must_contain="open.spotify.com/track/")
+
+
+async def spotify_search_track_scrape(artist: str, title: str) -> str | None:
+    term = _clean_title(f"{artist} {title}".strip())
+    if not term:
+        return None
+
+    cache_key = f"spotify_scrape::{term.lower()}"
+    cached = ttl_get(GENERIC_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    search_url = f"https://open.spotify.com/search/{quote(term)}"
+    try:
+        client = get_http_client()
+        r = await client.get(search_url, timeout=12)
+        html_text = r.text or ""
+        m = re.search(r'open\.spotify\.com/track/([A-Za-z0-9]+)', html_text)
+        if m:
+            result = f"https://open.spotify.com/track/{m.group(1)}"
+            ttl_set(GENERIC_CACHE, cache_key, result, GENERIC_CACHE_TTL)
+            return result
+    except Exception as e:
+        log.debug(f"spotify_search_track_scrape error: {e}")
+
+    ttl_set(GENERIC_CACHE, cache_key, None, 1800)
+    return None
+
+
+async def build_spotify_track_links(meta: dict) -> tuple[dict, dict]:
+    artist = _clean_artist(meta.get("artist") or meta.get("author_name") or "")
+    title = _clean_title(meta.get("name") or meta.get("title") or "")
+    if not title:
+        title = _clean_title(meta.get("title") or "")
+    query = quote_plus(" ".join(x for x in [artist, title] if x).strip())
+
+    links: dict[str, dict] = {
+        "spotify": {"url": meta["url"]},
+        "youtube": {"url": f"https://www.youtube.com/results?search_query={query}"},
+        "youtubemusic": {"url": f"https://music.youtube.com/search?q={query}"},
+        "soundcloud": {"url": f"https://soundcloud.com/search?q={query}"},
+        "bandcamp": {"url": f"https://bandcamp.com/search?q={query}&item_type=t"},
+    }
+
+    apple_track, isrc, apple_album = await apple_search_track(artist, title)
+    if apple_track:
+        links["applemusic"] = {"url": apple_track}
+
+    # A few optional direct enrichments if available
+    ddg_yt = await _ddg_first_result(f'site:youtube.com/watch "{title}" "{artist}"', must_contain="youtube.com/watch")
+    if ddg_yt:
+        links["youtube"] = {"url": ddg_yt}
+
+    ddg_sc = await _ddg_first_result(f'site:soundcloud.com "{title}" "{artist}"', must_contain="soundcloud.com/")
+    if ddg_sc:
+        links["soundcloud"] = {"url": ddg_sc}
+
+    extra = {
+        "artist": artist,
+        "title": title,
+        "isrc": isrc,
+        "apple_album": _regionalize_apple(apple_album, for_album=True) if apple_album else None,
+    }
+    return links, extra
+
+
+async def build_spotify_album_links(meta: dict) -> tuple[dict, dict]:
+    artist = _clean_artist(meta.get("artist") or meta.get("author_name") or "")
+    album = _clean_title(meta.get("name") or meta.get("title") or "")
+    query = quote_plus(" ".join(x for x in [artist, album] if x).strip())
+
+    links: dict[str, dict] = {
+        "spotify": {"url": meta["url"]},
+        "youtube": {"url": f"https://www.youtube.com/results?search_query={query}+album"},
+        "youtubemusic": {"url": f"https://music.youtube.com/search?q={query}"},
+        "soundcloud": {"url": f"https://soundcloud.com/search/sets?q={query}"},
+        "bandcamp": {"url": f"https://bandcamp.com/search?q={query}&item_type=a"},
+    }
+
+    apple_album = await apple_search_album(artist, album)
+    if apple_album:
+        links["applemusic"] = {"url": apple_album}
+
+    extra = {"artist": artist, "album": album}
+    return links, extra
+
+
+async def build_spotify_artist_links(meta: dict) -> tuple[dict, dict]:
+    artist = _clean_artist(meta.get("artist") or meta.get("name") or meta.get("title") or "")
+    query = quote_plus(artist)
+
+    links: dict[str, dict] = {
+        "spotify": {"url": meta["url"]},
+        "youtube": {"url": f"https://www.youtube.com/results?search_query={query}"},
+        "youtubemusic": {"url": f"https://music.youtube.com/search?q={query}"},
+        "soundcloud": {"url": f"https://soundcloud.com/search/people?q={query}"},
+        "bandcamp": {"url": f"https://bandcamp.com/search?q={query}"},
+    }
+
+    apple_artist = await apple_search_artist(artist)
+    if apple_artist:
+        links["applemusic"] = {"url": apple_artist}
+
+    extra = {"artist": artist}
+    return links, extra
+
+
+async def build_spotify_playlist_links(meta: dict) -> tuple[dict, dict]:
+    name = _clean_title(meta.get("name") or meta.get("title") or "")
+    owner = _clean_artist(meta.get("author_name") or meta.get("artist") or "")
+    query = quote_plus(" ".join(x for x in [owner, name] if x).strip())
+
+    links: dict[str, dict] = {
+        "spotify": {"url": meta["url"]},
+        "youtube": {"url": f"https://www.youtube.com/results?search_query={query}+playlist"},
+        "youtubemusic": {"url": f"https://music.youtube.com/search?q={query}"},
+        "soundcloud": {"url": f"https://soundcloud.com/search?q={query}"},
+        "bandcamp": {"url": f"https://bandcamp.com/search?q={query}"},
+    }
+    extra = {"name": name, "owner": owner}
+    return links, extra
+
+
+async def resolve_spotify_native(url: str) -> tuple[dict | None, str | None, str | None, str | None, str | None, list[tuple[str, str]], dict | None]:
+    """
+    Returns:
+    links, display_title, display_artist, cover, page_url, album_buttons, lyrics_links
+    """
+    url = normalize_music_url(url)
+    cache_key = f"spotify_native::{url}"
+    cached = ttl_get(SPOTIFY_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    meta = await _spotify_embed_metadata(url)
+    if not meta:
+        result = (None, None, None, None, None, [], None)
+        ttl_set(SPOTIFY_CACHE, cache_key, result, 900)
+        return result
+
+    kind = meta.get("kind") or "unknown"
+    cover = meta.get("thumbnail")
+    page_url = url
+    album_buttons: list[tuple[str, str]] = []
+    lyrics_links = None
+    display_title = None
+    display_artist = None
+
+    if kind == "track":
+        links, extra = await build_spotify_track_links(meta)
+        display_title = extra.get("title") or meta.get("name")
+        display_artist = extra.get("artist") or meta.get("artist")
+        if extra.get("apple_album"):
+            album_buttons.append(("💿🍎", extra["apple_album"]))
+        if display_title:
+            lyrics_links = await get_lyrics_links(display_artist or "", display_title)
+    elif kind == "album":
+        links, extra = await build_spotify_album_links(meta)
+        display_title = extra.get("album") or meta.get("name")
+        display_artist = extra.get("artist") or meta.get("artist")
+        apple_album = links.get("applemusic", {}).get("url")
+        if apple_album:
+            album_buttons.append(("💿🍎", apple_album))
+    elif kind == "artist":
+        links, extra = await build_spotify_artist_links(meta)
+        display_title = None
+        display_artist = extra.get("artist")
+    elif kind == "playlist":
+        links, extra = await build_spotify_playlist_links(meta)
+        display_title = extra.get("name")
+        display_artist = extra.get("owner")
+    else:
+        query = quote_plus(meta.get("title") or url)
+        links = {
+            "spotify": {"url": url},
+            "youtube": {"url": f"https://www.youtube.com/results?search_query={query}"},
+            "youtubemusic": {"url": f"https://music.youtube.com/search?q={query}"},
+            "soundcloud": {"url": f"https://soundcloud.com/search?q={query}"},
+        }
+        display_title = meta.get("title")
+        display_artist = meta.get("artist")
+
+    result = (links, display_title, display_artist, cover, page_url, album_buttons, lyrics_links)
+    ttl_set(SPOTIFY_CACHE, cache_key, result, SPOTIFY_CACHE_TTL)
+    return result
+
 
 # ===== Álbum =====
 ALBUM_LABEL = {
@@ -285,6 +769,7 @@ ALBUM_LABEL = {
     "youtube": "💿▶️",
     "soundcloud": "💿☁️",
 }
+
 
 async def _album_from_spotify(url: str):
     url = normalize_music_url(url)
@@ -301,8 +786,10 @@ async def _album_from_spotify(url: str):
         log.debug(f"Spotify album fetch fail: {e}")
     return None, None
 
+
 def _album_from_apple(url: str):
     return _regionalize_apple(url, for_album=True), None
+
 
 def _album_from_yt_like(url: str, prefer_music: bool):
     p = urlparse(url)
@@ -315,19 +802,20 @@ def _album_from_yt_like(url: str, prefer_music: bool):
         ), None
     return None, None
 
+
 async def _ytm_album_from_page(url: str, prefer_music: bool = True):
     try:
         client = get_http_client()
         r = await client.get(url, timeout=12)
-        html = r.text or ""
-        m = re.search(r'"playlistId":"(OLAK[^"]+)"', html) or re.search(r'list=(OLAK[^"&]+)', html)
+        html_text = r.text or ""
+        m = re.search(r'"playlistId":"(OLAK[^"]+)"', html_text) or re.search(r'list=(OLAK[^"&]+)', html_text)
         if m:
             pid = m.group(1)
             return (
                 f"https://music.youtube.com/playlist?list={pid}" if prefer_music
                 else f"https://www.youtube.com/playlist?list={pid}"
             ), None
-        m = re.search(r'"browseId":"(MPREb[^"]+)"', html) or re.search(r'/browse/(MPREb[^"?]+)', html)
+        m = re.search(r'"browseId":"(MPREb[^"]+)"', html_text) or re.search(r'/browse/(MPREb[^"?]+)', html_text)
         if m:
             bid = m.group(1)
             return f"https://music.youtube.com/browse/{bid}", None
@@ -335,11 +823,13 @@ async def _ytm_album_from_page(url: str, prefer_music: bool = True):
         log.debug(f"YT scrape fail: {e}")
     return None, None
 
+
 async def _album_from_youtube_robust(url: str, prefer_music: bool):
     album_url, _ = _album_from_yt_like(url, prefer_music)
     if album_url:
         return album_url, None
     return await _ytm_album_from_page(url, prefer_music)
+
 
 async def _album_from_soundcloud(url: str):
     p = urlparse(url)
@@ -347,6 +837,7 @@ async def _album_from_soundcloud(url: str):
     if inside:
         return f"https://soundcloud.com/{inside}", None
     return None, None
+
 
 async def derive_album_buttons_all(links: dict):
     buttons, seen = [], set()
@@ -375,9 +866,11 @@ async def derive_album_buttons_all(links: dict):
             buttons.append((ALBUM_LABEL.get(key, "💿"), album_url))
     return buttons
 
+
 # ===== Memoria links =====
 STORE: dict[str, dict] = {}
 ORDER = deque(maxlen=300)
+
 
 def remember_links(
     links: dict,
@@ -404,33 +897,15 @@ def remember_links(
         STORE.pop(old, None)
     return key
 
+
 # ===== Caches =====
 GENERIC_CACHE: dict[str, tuple[float, object]] = {}
 ODESLI_CACHE: dict[str, tuple[float, object]] = {}
 LYRICS_CACHE: dict[str, tuple[float, object]] = {}
+SETLIST_CACHE: dict[str, tuple[float, dict]] = {}
+
 
 # ===== Letras =====
-def _normalize_unicode(s: str) -> str:
-    if not s:
-        return ""
-    s = unicodedata.normalize("NFKC", s)
-    s = s.replace("\u2014", " ").replace("\u2013", " ").replace("—", " ").replace("–", " ")
-    s = s.replace("“", '"').replace("”", '"').replace("’", "'")
-    return " ".join(s.split())
-
-def _clean_title(title: str) -> str:
-    t = _normalize_unicode(title or "")
-    t = re.sub(r'\s*\(feat[^\)]*\)', '', t, flags=re.I)
-    t = re.sub(r'\s*-\s*(official|audio|video|lyrics?|remastered?|live.*)$', '', t, flags=re.I)
-    t = re.sub(r'\s*\[[^\]]*\]\s*$', '', t)
-    return t.strip()
-
-def _clean_artist(artist: str) -> str:
-    a = _normalize_unicode(artist or "")
-    a = re.split(r'[,&/]|feat\.?', a, flags=re.I)[0]
-    return a.strip()
-
-# Musixmatch (para links)
 async def _musixmatch_share_url(artist: str, title: str) -> str | None:
     if not MUSIXMATCH_KEY:
         return None
@@ -461,7 +936,7 @@ async def _musixmatch_share_url(artist: str, title: str) -> str | None:
     except Exception:
         return None
 
-# Lyrics.com vía STANDS4 (si tienes credenciales)
+
 async def _lyricscom_link(artist: str, title: str) -> str | None:
     q_artist = _clean_artist(artist or "")
     q_title = _clean_title(title or "")
@@ -489,189 +964,15 @@ async def _lyricscom_link(artist: str, title: str) -> str | None:
             pass
     return None
 
-# DuckDuckGo HTML
-DDG_HTML = "https://duckduckgo.com/html/?q={q}"
 
-def decode_ddg_redirect(link: str) -> str:
-    try:
-        if not link:
-            return link
-        if link.startswith("/l/") or "duckduckgo.com/l/?" in link:
-            full = "https://duckduckgo.com" + link if link.startswith("/l/") else link
-            qs = parse_qs(urlparse(full).query)
-            target = qs.get("uddg") or qs.get("u") or []
-            if target:
-                return unquote(target[0])
-        return link
-    except Exception:
-        return link
-
-async def _ddg_first_result(site: str, artist: str, title: str) -> str | None:
+async def _ddg_first_result_site(site: str, artist: str, title: str) -> str | None:
     q_title = _clean_title(title or "")
     q_artist = _clean_artist(artist or "")
     if not q_title:
         return None
-
-    cache_key = f"ddg::{site}::{q_artist}::{q_title}"
-    cached = ttl_get(GENERIC_CACHE, cache_key)
-    if cached is not None:
-        return cached
-
     query = f'site:{site} "{q_title}" "{q_artist}" lyrics'
-    url = DDG_HTML.format(q=quote_plus(query))
-    try:
-        client = get_http_client()
-        r = await client.get(url, timeout=10)
-        html = r.text or ""
-        m = re.search(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"', html) or \
-            re.search(r'<a[^>]+class="result__url"[^>]+href="([^"]+)"', html)
-        if not m:
-            ttl_set(GENERIC_CACHE, cache_key, None, 1800)
-            return None
-        link = decode_ddg_redirect(m.group(1))
-        if site not in link:
-            ttl_set(GENERIC_CACHE, cache_key, None, 1800)
-            return None
-        ttl_set(GENERIC_CACHE, cache_key, link, GENERIC_CACHE_TTL)
-        return link
-    except Exception:
-        ttl_set(GENERIC_CACHE, cache_key, None, 1800)
-        return None
+    return await _ddg_first_result(query, must_contain=site)
 
-# -------- Spotify helpers (nuevo: vía ISRC) --------
-async def apple_search_track(artist: str, title: str) -> tuple[str | None, str | None]:
-    term = f"{artist} {title}".strip()
-    cache_key = f"apple_search::{COUNTRY}::{term.lower()}"
-    cached = ttl_get(GENERIC_CACHE, cache_key)
-    if cached is not None:
-        return cached
-
-    params = {"term": term, "entity": "song", "limit": 1, "country": COUNTRY, "media": "music"}
-    url = "https://itunes.apple.com/search"
-    try:
-        client = get_http_client()
-        r = await client.get(url, params=params, timeout=12)
-        if r.status_code != 200:
-            ttl_set(GENERIC_CACHE, cache_key, (None, None), 1800)
-            return None, None
-        data = r.json()
-        results = data.get("results") or []
-        if not results:
-            ttl_set(GENERIC_CACHE, cache_key, (None, None), 1800)
-            return None, None
-        it = results[0]
-        result = (it.get("trackViewUrl"), it.get("isrc"))
-        ttl_set(GENERIC_CACHE, cache_key, result, GENERIC_CACHE_TTL)
-        return result
-    except Exception as e:
-        log.debug(f"Apple search falló para '{term}': {e}")
-        ttl_set(GENERIC_CACHE, cache_key, (None, None), 1800)
-        return None, None
-
-async def spotify_url_from_isrc(isrc: str) -> str | None:
-    if not isrc:
-        return None
-
-    cache_key = f"spotify_isrc::{isrc}"
-    cached = ttl_get(GENERIC_CACHE, cache_key)
-    if cached is not None:
-        return cached
-
-    search_url = f"https://open.spotify.com/search/{quote('isrc:' + isrc)}"
-    try:
-        client = get_http_client()
-        r = await client.get(search_url, timeout=12)
-        html = r.text or ""
-        m = re.search(r'open\.spotify\.com/track/([A-Za-z0-9]+)', html)
-        if m:
-            result = f"https://open.spotify.com/track/{m.group(1)}"
-            ttl_set(GENERIC_CACHE, cache_key, result, GENERIC_CACHE_TTL)
-            return result
-    except Exception as e:
-        log.debug(f"spotify_url_from_isrc error: {e}")
-
-    ttl_set(GENERIC_CACHE, cache_key, None, 1800)
-    return None
-
-async def ddg_spotify_track(artist: str, title: str) -> str | None:
-    q_title = _clean_title(title or "")
-    q_artist = _clean_artist(artist or "")
-    if not q_title:
-        return None
-
-    cache_key = f"ddg_spotify::{q_artist}::{q_title}"
-    cached = ttl_get(GENERIC_CACHE, cache_key)
-    if cached is not None:
-        return cached
-
-    query = f'site:open.spotify.com/track "{q_title}" "{q_artist}"'
-    url = DDG_HTML.format(q=quote_plus(query))
-    try:
-        client = get_http_client()
-        r = await client.get(url, timeout=10)
-        html = r.text or ""
-        m = re.search(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"', html) or \
-            re.search(r'<a[^>]+class="result__url"[^>]+href="([^"]+)"', html)
-        if not m:
-            ttl_set(GENERIC_CACHE, cache_key, None, 1800)
-            return None
-        link = decode_ddg_redirect(m.group(1))
-        if "open.spotify.com/track/" not in link:
-            ttl_set(GENERIC_CACHE, cache_key, None, 1800)
-            return None
-        result = link.split("?")[0]
-        ttl_set(GENERIC_CACHE, cache_key, result, GENERIC_CACHE_TTL)
-        return result
-    except Exception as e:
-        log.debug(f"ddg_spotify_track error: {e}")
-
-    ttl_set(GENERIC_CACHE, cache_key, None, 1800)
-    return None
-
-async def spotify_search_track_scrape(artist: str, title: str) -> str | None:
-    term = _clean_title(f"{artist} {title}".strip())
-    if not term:
-        return None
-
-    cache_key = f"spotify_scrape::{term.lower()}"
-    cached = ttl_get(GENERIC_CACHE, cache_key)
-    if cached is not None:
-        return cached
-
-    search_url = f"https://open.spotify.com/search/{quote(term)}"
-    try:
-        client = get_http_client()
-        r = await client.get(search_url, timeout=12)
-        html = r.text or ""
-        m = re.search(r'open\.spotify\.com/track/([A-Za-z0-9]+)', html)
-        if m:
-            result = f"https://open.spotify.com/track/{m.group(1)}"
-            ttl_set(GENERIC_CACHE, cache_key, result, GENERIC_CACHE_TTL)
-            return result
-    except Exception as e:
-        log.debug(f"spotify_search_track_scrape error: {e}")
-
-    ttl_set(GENERIC_CACHE, cache_key, None, 1800)
-    return None
-
-async def ensure_spotify_link(links: dict, artist: str | None, title: str | None) -> dict:
-    if not links or "spotify" in links or not title:
-        return links
-    try:
-        _, isrc = await apple_search_track(artist or "", title or "")
-        if isrc:
-            sp = await spotify_url_from_isrc(isrc)
-            if sp:
-                return {**links, "spotify": {"url": sp}}
-        sp = await ddg_spotify_track(artist or "", title or "")
-        if sp:
-            return {**links, "spotify": {"url": sp}}
-        sp = await spotify_search_track_scrape(artist or "", title or "")
-        if sp:
-            return {**links, "spotify": {"url": sp}}
-    except Exception as e:
-        log.debug(f"ensure_spotify_link fallo: {e}")
-    return links
 
 async def get_lyrics_links(artist: str | None, title: str | None) -> dict | None:
     artist = artist or ""
@@ -689,9 +990,9 @@ async def get_lyrics_links(artist: str | None, title: str | None) -> dict | None
         _lyricscom_link(artist, title),
     )
     letras, az, genius = await asyncio.gather(
-        _ddg_first_result("www.letras.com", artist, title),
-        _ddg_first_result("www.azlyrics.com", artist, title),
-        _ddg_first_result("genius.com", artist, title),
+        _ddg_first_result_site("www.letras.com", artist, title),
+        _ddg_first_result_site("www.azlyrics.com", artist, title),
+        _ddg_first_result_site("genius.com", artist, title),
     )
 
     result = None
@@ -706,7 +1007,25 @@ async def get_lyrics_links(artist: str | None, title: str | None) -> dict | None
     ttl_set(LYRICS_CACHE, cache_key, result, LYRICS_CACHE_TTL)
     return result
 
+
 # =================== Teclados ===================
+def build_artist_search_keyboard(artist_name: str) -> InlineKeyboardMarkup:
+    q = quote(artist_name)
+    buttons = [
+        [
+            InlineKeyboardButton("Espotifai", url=f"https://open.spotify.com/search/{q}"),
+            InlineKeyboardButton("Yutú", url=f"https://www.youtube.com/results?search_query={q}"),
+            InlineKeyboardButton("Yutúmusic", url=f"https://music.youtube.com/search?q={q}"),
+        ],
+        [
+            InlineKeyboardButton("Manzanita", url=f"https://music.apple.com/{COUNTRY.lower()}/search?term={q}"),
+            InlineKeyboardButton("SounClou", url=f"https://soundcloud.com/search?q={q}"),
+            InlineKeyboardButton("Bandcamp", url=f"https://bandcamp.com/search?q={q}&item_type=b"),
+        ],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
 def build_keyboard(
     links: dict,
     show_all: bool,
@@ -766,7 +1085,8 @@ def build_keyboard(
 
     return InlineKeyboardMarkup(botones)
 
-# ===== Odesli =====
+
+# ===== Odesli (optional, non-critical) =====
 async def fetch_odesli(url: str):
     api = "https://api.song.link/v1-alpha.1/links"
     normalized_url = normalize_music_url(url)
@@ -784,7 +1104,8 @@ async def fetch_odesli(url: str):
 
         for attempt in range(ODESLI_MAX_RETRIES):
             try:
-                r = await client.get(api, params=params, headers=headers, timeout=12)
+                await _throttle_odesli()
+                r = await client.get(api, params=params, headers=headers, timeout=10)
 
                 if r.status_code == 200:
                     data = r.json()
@@ -803,7 +1124,7 @@ async def fetch_odesli(url: str):
                     return result
 
                 if r.status_code == 429:
-                    wait_s = min(2 * (attempt + 1), 10)
+                    wait_s = min(2 * (attempt + 1), 6)
                     log.warning(
                         f"Odesli 429 para {normalized_url}. "
                         f"Reintento {attempt + 1}/{ODESLI_MAX_RETRIES} en {wait_s}s"
@@ -816,7 +1137,7 @@ async def fetch_odesli(url: str):
                 return None, None, None, None, None
 
             except Exception as e:
-                wait_s = min(1 + attempt, 5)
+                wait_s = min(1 + attempt, 3)
                 log.warning(
                     f"Odesli error intento {attempt + 1}/{ODESLI_MAX_RETRIES} "
                     f"para {normalized_url}: {e}"
@@ -826,11 +1147,20 @@ async def fetch_odesli(url: str):
     ttl_set(ODESLI_CACHE, normalized_url, (None, None, None, None, None), 300)
     return None, None, None, None, None
 
-# ======== SETLIST.FM ========
-SETLIST_CACHE: dict[str, tuple[float, dict]] = {}
 
-# Acepta IDs alfanuméricos 6–12, y extrae por estructura o por último "-ID" del segmento final
+async def resolve_non_spotify(url: str) -> tuple[dict | None, str | None, str | None, str | None, str | None, list[tuple[str, str]], dict | None]:
+    links, title, artist_name, cover, page_url = await fetch_odesli(url)
+    if not links:
+        return None, None, None, None, None, [], None
+    # Best-effort enrichment only when Odesli already succeeded
+    lyrics_links = await get_lyrics_links(artist_name or "", title or "")
+    album_buttons = await derive_album_buttons_all(links)
+    return links, title, artist_name, cover, page_url, album_buttons, lyrics_links
+
+
+# ======== SETLIST.FM ========
 ID_RE = re.compile(r"([0-9a-z]{6,12})$", re.I)
+
 
 def _extract_setlist_id_from_path(path: str) -> str | None:
     last = path.rstrip("/").split("/")[-1]
@@ -842,25 +1172,27 @@ def _extract_setlist_id_from_path(path: str) -> str | None:
     m = ID_RE.search(core)
     return m.group(1).lower() if m else None
 
+
 async def _extract_setlist_id_from_html(url: str) -> str | None:
     try:
         client = get_http_client()
         r = await client.get(url, timeout=12)
         if r.status_code != 200:
             return None
-        html = r.text or ""
-        m = re.search(r'property=["\']og:url["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+        html_text = r.text or ""
+        m = re.search(r'property=["\']og:url["\'][^>]+content=["\']([^"\']+)["\']', html_text, re.I)
         if m:
             canon = m.group(1)
             pid = _extract_setlist_id_from_path(urlparse(canon).path)
             if pid:
                 return pid
-        m = re.search(r'/setlist/[^"\']*?-([0-9a-z]{6,12})\.html', html, re.I)
+        m = re.search(r'/setlist/[^"\']*?-([0-9a-z]{6,12})\.html', html_text, re.I)
         if m:
             return m.group(1).lower()
     except Exception as e:
         log.debug(f"fetch html setlist fallback error: {e}")
     return None
+
 
 def _extract_setlist_id(url: str) -> str | None:
     try:
@@ -869,6 +1201,7 @@ def _extract_setlist_id(url: str) -> str | None:
         return pid
     except Exception:
         return None
+
 
 async def fetch_setlist_json(setlist_id: str) -> dict | None:
     if not SETLIST_FM_API_KEY:
@@ -899,12 +1232,14 @@ async def fetch_setlist_json(setlist_id: str) -> dict | None:
         log.warning(f"Error consultando setlist.fm: {e}")
     return None
 
+
 def _ensure_list(x):
     if not x:
         return []
     if isinstance(x, list):
         return x
     return [x]
+
 
 def parse_setlist_songs(js: dict) -> tuple[dict, list[dict]]:
     if not js:
@@ -940,16 +1275,28 @@ def parse_setlist_songs(js: dict) -> tuple[dict, list[dict]]:
     }
     return meta, songs
 
+
 async def apple_search_track_url(artist: str, title: str) -> str | None:
-    url, _ = await apple_search_track(artist, title)
-    return _regionalize_apple(url, for_album=False) if url else None
+    url, _, _ = await apple_search_track(artist, title)
+    return url
+
 
 async def resolve_song_links(artist: str, title: str) -> tuple[dict | None, str | None]:
-    seed = await apple_search_track_url(artist, title)
-    if not seed:
-        return None, None
-    links, t, a, thumb, page_url = await fetch_odesli(seed)
-    return links, page_url
+    # Prefer native searches for stability; enrich with Odesli only if available.
+    apple = await apple_search_track_url(artist, title)
+    query = quote_plus(f"{artist} {title}".strip())
+    links = {
+        "youtube": {"url": f"https://www.youtube.com/results?search_query={query}"},
+        "youtubemusic": {"url": f"https://music.youtube.com/search?q={query}"},
+        "soundcloud": {"url": f"https://soundcloud.com/search?q={query}"},
+    }
+    if apple:
+        links["applemusic"] = {"url": apple}
+        o_links, *_rest = await fetch_odesli(apple)
+        if o_links:
+            links.update(o_links)
+    return links, None
+
 
 def _pick_youtube_key(links: dict) -> str | None:
     if "youtubemusic" in links:
@@ -958,8 +1305,10 @@ def _pick_youtube_key(links: dict) -> str | None:
         return "youtube"
     return None
 
+
 SETLIST_STORE: dict[str, dict] = {}
 SETLIST_ORDER = deque(maxlen=120)
+
 
 def remember_setlist(setlist_id: str, meta: dict, items: list[dict]) -> str:
     key = uuid.uuid4().hex
@@ -970,9 +1319,11 @@ def remember_setlist(setlist_id: str, meta: dict, items: list[dict]) -> str:
         SETLIST_STORE.pop(old, None)
     return key
 
+
 def _format_song_label(idx: int, title: str, cover: str | None) -> str:
     base = f"{idx}. {title}"
     return f"{base} (cover de {cover})" if cover else base
+
 
 def build_setlist_keyboard(key: str, page: int) -> InlineKeyboardMarkup:
     entry = SETLIST_STORE.get(key)
@@ -1028,6 +1379,7 @@ def build_setlist_keyboard(key: str, page: int) -> InlineKeyboardMarkup:
         ])
 
     return InlineKeyboardMarkup(botones)
+
 
 async def handle_setlist(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     setlist_id = _extract_setlist_id(url)
@@ -1086,6 +1438,21 @@ async def handle_setlist(update: Update, context: ContextTypes.DEFAULT_TYPE, url
     keyboard = build_setlist_keyboard(key, page=0)
     await update.message.reply_text(caption, reply_markup=keyboard)
 
+
+def build_caption(title: str | None, artist_name: str | None, kind_hint: str | None = None) -> str:
+    if title and artist_name:
+        return f"🎵 {title} — {artist_name}\n🎶 Disponible en:"
+    if title:
+        if kind_hint == "playlist":
+            return f"📃 {title}\n🎶 Disponible en:"
+        if kind_hint == "album":
+            return f"💿 {title}\n🎶 Disponible en:"
+        return f"🎵 {title}\n🎶 Disponible en:"
+    if artist_name:
+        return f"🧑‍🎤 {artist_name}\n🔎 Disponible en:"
+    return "🎶 Disponible en:"
+
+
 # -------- Chat handler --------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text if update.message else ""
@@ -1107,14 +1474,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(caption, reply_markup=kb)
                 continue
 
-            links, title, artist_name, cover, page_url = await fetch_odesli(url)
+            if is_spotify_url(url):
+                links, title, artist_name, cover, page_url, album_buttons, lyrics_links = await resolve_spotify_native(url)
+                if not links:
+                    await update.message.reply_text("No pude leer ese enlace de Spotify ahora. Intenta de nuevo en un momento.")
+                    continue
+                key = remember_links(
+                    links=links,
+                    album_buttons=album_buttons,
+                    lyrics_links=lyrics_links,
+                    title=title,
+                    artist_name=artist_name,
+                    cover=cover,
+                    page_url=page_url,
+                )
+                keyboard = build_keyboard(
+                    links,
+                    show_all=False,
+                    key=key,
+                    album_buttons=album_buttons,
+                    lyrics_links=lyrics_links,
+                )
+                kind_hint = _spotify_kind_from_url(url)
+                caption = build_caption(title, artist_name, kind_hint=kind_hint)
+                if cover:
+                    try:
+                        await context.bot.send_photo(
+                            chat_id=update.effective_chat.id,
+                            photo=cover,
+                            caption=caption,
+                            reply_markup=keyboard,
+                        )
+                        continue
+                    except Exception as e:
+                        log.info(f"No pude usar la portada Spotify, envío texto. {e}")
+                await update.message.reply_text(caption, reply_markup=keyboard)
+                continue
+
+            links, title, artist_name, cover, page_url, album_buttons, lyrics_links = await resolve_non_spotify(url)
             if not links:
                 await update.message.reply_text("No pude resolver ese enlace ahora. Intenta de nuevo en un momento.")
                 continue
 
-            links = await ensure_spotify_link(links, artist_name or "", title or "")
-            lyrics_links = await get_lyrics_links(artist_name or "", title or "")
-            album_buttons = await derive_album_buttons_all(links)
             key = remember_links(
                 links=links,
                 album_buttons=album_buttons,
@@ -1132,12 +1533,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lyrics_links=lyrics_links,
             )
 
-            caption = "🎶 Disponible en:"
-            if title and artist_name:
-                caption = f"🎵 {title} — {artist_name}\n🎶 Disponible en:"
-            elif title:
-                caption = f"🎵 {title}\n🎶 Disponible en:"
-
+            caption = build_caption(title, artist_name)
             if cover:
                 try:
                     await context.bot.send_photo(
@@ -1151,6 +1547,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log.info(f"No pude usar la portada, envío texto. {e}")
 
             await update.message.reply_text(caption, reply_markup=keyboard)
+
 
 # -------- Inline mode --------
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1183,14 +1580,15 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.inline_query.answer(results, cache_time=10, is_personal=True)
         return
 
-    links, title, artist_name, cover, page_url = await fetch_odesli(url)
+    if is_spotify_url(url):
+        links, title, artist_name, cover, page_url, album_buttons, lyrics_links = await resolve_spotify_native(url)
+    else:
+        links, title, artist_name, cover, page_url, album_buttons, lyrics_links = await resolve_non_spotify(url)
+
     if not links:
         await update.inline_query.answer([], cache_time=5, is_personal=True)
         return
 
-    links = await ensure_spotify_link(links, artist_name or "", title or "")
-    lyrics_links = await get_lyrics_links(artist_name or "", title or "")
-    album_buttons = await derive_album_buttons_all(links)
     key = remember_links(
         links=links,
         album_buttons=album_buttons,
@@ -1208,11 +1606,8 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         lyrics_links=lyrics_links,
     )
 
-    caption = "🎶 Disponible en:"
-    if title and artist_name:
-        caption = f"🎵 {title} — {artist_name}\n🎶 Disponible en:"
-    elif title:
-        caption = f"🎵 {title}\n🎶 Disponible en:"
+    kind_hint = _spotify_kind_from_url(url) if is_spotify_url(url) else None
+    caption = build_caption(title, artist_name, kind_hint=kind_hint)
 
     rid = str(uuid.uuid4())
     if cover:
@@ -1230,7 +1625,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         results = [
             InlineQueryResultArticle(
                 id=rid,
-                title=title or "Plataformas",
+                title=title or artist_name or "Plataformas",
                 input_message_content=InputTextMessageContent(caption),
                 reply_markup=keyboard,
                 description="Enviar accesos a otras plataformas",
@@ -1238,6 +1633,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         ]
 
     await update.inline_query.answer(results, cache_time=10, is_personal=True)
+
 
 # -------- Callbacks --------
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1249,7 +1645,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("slp|"):
-        _, key, page_s = data.split("|", 3)
+        _, key, page_s = data.split("|", 2)
         try:
             page = int(page_s)
         except Exception:
@@ -1307,6 +1703,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning(f"No pude editar el teclado: {e}")
 
+
 # -------- Post-init / main --------
 async def _post_init(app: Application):
     try:
@@ -1315,8 +1712,10 @@ async def _post_init(app: Application):
     except Exception as e:
         log.warning(f"No pude limpiar webhook: {e}")
 
+
 async def health_handler(request):
     return web.Response(text="ok")
+
 
 async def start_health_server():
     app = web.Application()
@@ -1327,6 +1726,7 @@ async def start_health_server():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info(f"Health server listo en :{PORT}/healthz")
+
 
 async def main():
     tg = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
@@ -1342,6 +1742,7 @@ async def main():
     await tg.updater.start_polling(drop_pending_updates=True)
     await asyncio.Event().wait()
 
+
 async def shutdown_http_client():
     global HTTP_CLIENT
     if HTTP_CLIENT is not None:
@@ -1350,6 +1751,7 @@ async def shutdown_http_client():
         except Exception:
             pass
         HTTP_CLIENT = None
+
 
 if __name__ == "__main__":
     try:
