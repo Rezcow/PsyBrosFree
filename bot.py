@@ -272,6 +272,7 @@ GENERIC_CACHE: dict[str, tuple[float, object]] = {}
 ODESLI_CACHE: dict[str, tuple[float, object]] = {}
 LYRICS_CACHE: dict[str, tuple[float, object]] = {}
 SETLIST_CACHE: dict[str, tuple[float, object]] = {}
+APPLE_CACHE: dict[str, tuple[float, object]] = {}
 
 
 DDG_HTML = "https://duckduckgo.com/html/?q={q}"
@@ -301,6 +302,311 @@ def _extract_spotify_entity(url: str) -> tuple[str | None, str | None]:
     except Exception:
         pass
     return None, None
+
+
+def _extract_apple_entity(url: str) -> tuple[str | None, str | None]:
+    try:
+        p = urlparse(normalize_music_url(url))
+        parts = [x for x in p.path.split("/") if x]
+        for idx, part in enumerate(parts):
+            if part in {"song", "album", "artist", "playlist"}:
+                entity_id = None
+                qs = parse_qs(p.query)
+                if part == "song":
+                    entity_id = (qs.get("i") or [None])[0]
+                elif idx + 2 < len(parts):
+                    entity_id = parts[idx + 2]
+                elif idx + 1 < len(parts):
+                    entity_id = parts[idx + 1]
+                return ({"song": "track"}.get(part, part), entity_id)
+    except Exception:
+        pass
+    return None, None
+
+
+async def _apple_html(url: str) -> str | None:
+    cache_key = f"apple_html::{normalize_music_url(url)}"
+    cached = ttl_get(GENERIC_CACHE, cache_key)
+    if cached is not None:
+        return cached
+    try:
+        client = get_http_client()
+        r = await client.get(normalize_music_url(url), timeout=15)
+        if r.status_code == 200:
+            ttl_set(GENERIC_CACHE, cache_key, r.text, GENERIC_CACHE_TTL)
+            return r.text
+    except Exception as e:
+        log.debug(f"apple html fail: {e}")
+    ttl_set(GENERIC_CACHE, cache_key, None, 900)
+    return None
+
+
+def _parse_apple_title(raw: str) -> tuple[str | None, str | None, str | None]:
+    raw = _norm_text(raw)
+    raw = re.sub(r"\s*on Apple Music$", "", raw, flags=re.I)
+
+    m = re.match(r"^(.*?)\s+by\s+(.*?)$", raw, re.I)
+    if m:
+        left = _clean_title(m.group(1))
+        artist = _clean_artist(m.group(2))
+        return None, artist or None, left or None
+
+    m = re.match(r"^(.*?)\s*[—-]\s*(.*?)$", raw)
+    if m:
+        left = _clean_title(m.group(1))
+        right = _clean_artist(m.group(2))
+        if left and right and not _safe_eq(left, right):
+            return None, right or None, left or None
+
+    return None, None, raw or None
+
+
+async def _apple_best_metadata(url: str) -> dict:
+    normalized = normalize_music_url(url)
+    cached = ttl_get(APPLE_CACHE, normalized)
+    if cached is not None:
+        return cached
+
+    entity_type, entity_id = _extract_apple_entity(normalized)
+    data = {
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "title": None,
+        "artist": None,
+        "album": None,
+        "cover": None,
+        "apple_url": normalized,
+    }
+
+    html_text = await _apple_html(normalized)
+    if html_text:
+        title_tag = _extract_title_tag(html_text)
+        og_title = _extract_meta_content(html_text, "og:title")
+        og_desc = _extract_meta_content(html_text, "og:description")
+        og_image = _extract_meta_content(html_text, "og:image")
+        if og_image:
+            data["cover"] = og_image
+
+        for candidate in [title_tag, og_title]:
+            if candidate:
+                _, artist_guess, title_guess = _parse_apple_title(candidate)
+                if title_guess and not data["title"]:
+                    data["title"] = title_guess
+                if artist_guess and not data["artist"] and not _safe_eq(artist_guess, title_guess):
+                    data["artist"] = artist_guess
+
+        if og_desc and not data.get("artist"):
+            m = re.search(r"(?:by|de)\s+(.+)$", og_desc, re.I)
+            if m:
+                artist_guess = _clean_artist(m.group(1))
+                if artist_guess and not _safe_eq(artist_guess, data.get("title")):
+                    data["artist"] = artist_guess
+
+        records = _extract_jsonld(html_text)
+        rec = _jsonld_music_record(records)
+        if rec:
+            rec_type = ((rec.get("@type") if not isinstance(rec.get("@type"), list) else (rec.get("@type") or [None])[0]) or "").lower()
+            if not data.get("entity_type"):
+                if "recording" in rec_type:
+                    data["entity_type"] = "track"
+                elif "album" in rec_type:
+                    data["entity_type"] = "album"
+                elif "playlist" in rec_type:
+                    data["entity_type"] = "playlist"
+                elif "group" in rec_type or "person" in rec_type:
+                    data["entity_type"] = "artist"
+
+            name = _clean_title(rec.get("name") or "")
+            if name and not data["title"]:
+                data["title"] = name
+
+            by_artist = rec.get("byArtist") or rec.get("author") or rec.get("creator")
+            if isinstance(by_artist, list) and by_artist:
+                by_artist = by_artist[0]
+            if isinstance(by_artist, dict):
+                artist_name = _clean_artist(by_artist.get("name") or "")
+                if artist_name and not _safe_eq(artist_name, data.get("title")):
+                    data["artist"] = data["artist"] or artist_name
+            elif isinstance(by_artist, str):
+                artist_name = _clean_artist(by_artist)
+                if artist_name and not _safe_eq(artist_name, data.get("title")):
+                    data["artist"] = data["artist"] or artist_name
+
+            image = rec.get("image")
+            if isinstance(image, list) and image:
+                image = image[0]
+            if isinstance(image, str) and image:
+                data["cover"] = data["cover"] or image
+
+            in_album = rec.get("inAlbum")
+            if isinstance(in_album, dict):
+                alb_name = _clean_title(in_album.get("name") or "")
+                if alb_name:
+                    data["album"] = alb_name
+
+    if data.get("artist") and _safe_eq(data.get("artist"), data.get("title")):
+        data["artist"] = None
+
+    if not data.get("entity_type"):
+        data["entity_type"] = entity_type or "track"
+
+    ttl_set(APPLE_CACHE, normalized, data, SPOTIFY_CACHE_TTL)
+    return data
+
+
+async def spotify_search_track(artist: str, title: str) -> str | None:
+    q_title = _clean_title(title or "")
+    q_artist = _clean_artist(artist or "")
+    if not q_title:
+        return None
+    direct = await _ddg_first_result(
+        f'site:open.spotify.com/track "{q_title}" "{q_artist}"',
+        ("open.spotify.com",),
+    )
+    if direct and "/track/" in direct:
+        return normalize_music_url(direct)
+    q = quote(f'track:{q_title} artist:{q_artist}'.strip())
+    return f"https://open.spotify.com/search/{q}"
+
+
+async def spotify_search_album(artist: str, album: str) -> str | None:
+    q_album = _clean_title(album or "")
+    q_artist = _clean_artist(artist or "")
+    if not q_album:
+        return None
+    direct = await _ddg_first_result(
+        f'site:open.spotify.com/album "{q_album}" "{q_artist}"',
+        ("open.spotify.com",),
+    )
+    if direct and "/album/" in direct:
+        return normalize_music_url(direct)
+    q = quote(f'album:{q_album} artist:{q_artist}'.strip())
+    return f"https://open.spotify.com/search/{q}"
+
+
+async def spotify_search_artist(artist: str) -> str | None:
+    q_artist = _clean_artist(artist or "")
+    if not q_artist:
+        return None
+    direct = await _ddg_first_result(
+        f'site:open.spotify.com/artist "{q_artist}"',
+        ("open.spotify.com",),
+    )
+    if direct and "/artist/" in direct:
+        return normalize_music_url(direct)
+    return f"https://open.spotify.com/search/{quote(q_artist)}"
+
+
+async def complete_links_with_fallbacks(links: dict | None, entity_type: str | None, title: str | None, artist: str | None, album: str | None = None) -> dict:
+    links = normalize_links(links or {})
+    entity_type = (entity_type or "track").lower()
+    title = _clean_title(title or "") or None
+    artist = _clean_artist(artist or "") or None
+    album = _clean_title(album or "") or None
+
+    if entity_type == "artist":
+        if artist or title:
+            name = artist or title
+            if "spotify" not in links:
+                sp = await spotify_search_artist(name)
+                if sp:
+                    links["spotify"] = {"url": sp}
+            if "youtube" not in links:
+                links["youtube"] = {"url": f"https://www.youtube.com/results?search_query={quote_plus(name)}"}
+            if "youtubemusic" not in links:
+                links["youtubemusic"] = {"url": f"https://music.youtube.com/search?q={quote_plus(name)}"}
+            if "applemusic" not in links:
+                am = await apple_search_artist(name)
+                if am:
+                    links["applemusic"] = {"url": _regionalize_apple(am)}
+        return links
+
+    if entity_type == "album":
+        album_name = title or album
+        if album_name:
+            if "spotify" not in links:
+                sp = await spotify_search_album(artist or "", album_name)
+                if sp:
+                    links["spotify"] = {"url": sp}
+            q = build_query(artist, album_name, kind="album")
+            if q and "youtube" not in links:
+                links["youtube"] = {"url": f"https://www.youtube.com/results?search_query={quote_plus(q)}"}
+            if q and "youtubemusic" not in links:
+                links["youtubemusic"] = {"url": f"https://music.youtube.com/search?q={quote_plus(q)}"}
+            if "applemusic" not in links:
+                am = await apple_search_album(artist or "", album_name)
+                if am:
+                    links["applemusic"] = {"url": _regionalize_apple(am, for_album=True)}
+        return links
+
+    if entity_type == "playlist":
+        q = _clean_title(title or "playlist")
+        if q and "spotify" not in links:
+            links["spotify"] = {"url": f"https://open.spotify.com/search/{quote(q + ' playlist')}"}
+        if q and "youtube" not in links:
+            links["youtube"] = {"url": f"https://www.youtube.com/results?search_query={quote_plus(q + ' playlist')}"}
+        if q and "youtubemusic" not in links:
+            links["youtubemusic"] = {"url": f"https://music.youtube.com/search?q={quote_plus(q + ' playlist')}"}
+        if q and "applemusic" not in links:
+            links["applemusic"] = {"url": f"https://music.apple.com/{COUNTRY.lower()}/search?term={quote_plus(q + ' playlist')}"}
+        return links
+
+    q = build_query(artist, title, kind="track")
+    if title:
+        if "spotify" not in links:
+            sp = await spotify_search_track(artist or "", title)
+            if sp:
+                links["spotify"] = {"url": sp}
+        if "youtube" not in links:
+            direct_yt = await _ddg_first_result(
+                f'site:youtube.com/watch "{_clean_title(title or "")}" "{_clean_artist(artist or "")}"',
+                ("youtube.com",),
+            )
+            links["youtube"] = {"url": direct_yt or f"https://www.youtube.com/results?search_query={quote_plus(q)}"}
+        if "youtubemusic" not in links and q:
+            links["youtubemusic"] = {"url": f"https://music.youtube.com/search?q={quote_plus(q)}"}
+        if "applemusic" not in links:
+            am, _ = await apple_search_track(artist or "", title)
+            if am:
+                links["applemusic"] = {"url": _regionalize_apple(am)}
+        if "soundcloud" not in links and q:
+            direct_sc = await _ddg_first_result(
+                f'site:soundcloud.com/ "{_clean_title(title or "")}" "{_clean_artist(artist or "")}"',
+                ("soundcloud.com",),
+            )
+            links["soundcloud"] = {"url": direct_sc or f"https://soundcloud.com/search?q={quote_plus(q)}"}
+
+    return links
+
+
+async def resolve_generic_music_url(url: str) -> tuple[dict | None, str | None, str | None, str | None, str | None]:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+
+    if "spotify.com" in host:
+        links, title, artist_name, cover, page_url = await resolve_spotify_links(url)
+        meta = {"entity_type": "track", "album": None}
+    else:
+        links, title, artist_name, cover, page_url = await fetch_odesli(url)
+        meta = {"entity_type": None, "album": None}
+
+        if any(x in host for x in ["music.apple.com", "itunes.apple.com", "geo.music.apple.com"]):
+            ameta = await _apple_best_metadata(url)
+            meta = ameta
+            title = title or ameta.get("title")
+            artist_name = artist_name or ameta.get("artist")
+            cover = cover or ameta.get("cover")
+            page_url = page_url or ameta.get("apple_url")
+
+        links = await complete_links_with_fallbacks(
+            links=links,
+            entity_type=meta.get("entity_type") or "track",
+            title=title,
+            artist=artist_name,
+            album=meta.get("album"),
+        )
+
+    return links, title, artist_name, cover, page_url
 
 
 def _parse_spotify_title(raw: str) -> tuple[str | None, str | None, str | None]:
@@ -1416,12 +1722,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(caption, reply_markup=kb)
                 continue
 
-            parsed = urlparse(url)
-            host = parsed.netloc.lower()
-            if "spotify.com" in host:
-                links, title, artist_name, cover, page_url = await resolve_spotify_links(url)
-            else:
-                links, title, artist_name, cover, page_url = await fetch_odesli(url)
+            links, title, artist_name, cover, page_url = await resolve_generic_music_url(url)
 
             if not links:
                 await update.message.reply_text("No pude resolver ese enlace ahora. Intenta de nuevo en un momento.")
@@ -1498,12 +1799,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.inline_query.answer(results, cache_time=10, is_personal=True)
         return
 
-    parsed = urlparse(url)
-    host = parsed.netloc.lower()
-    if "spotify.com" in host:
-        links, title, artist_name, cover, page_url = await resolve_spotify_links(url)
-    else:
-        links, title, artist_name, cover, page_url = await fetch_odesli(url)
+    links, title, artist_name, cover, page_url = await resolve_generic_music_url(url)
 
     if not links:
         await update.inline_query.answer([], cache_time=5, is_personal=True)
